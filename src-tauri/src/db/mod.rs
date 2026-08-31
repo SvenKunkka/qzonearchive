@@ -17,7 +17,7 @@ use tauri::Manager;
 use crate::model;
 
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub struct Migration {
     pub version: i64,
@@ -35,6 +35,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "v2_unified_model",
         apply: migration_v2,
+    },
+    Migration {
+        version: 3,
+        name: "v3_source_state_columns",
+        apply: migration_v3,
     },
 ];
 
@@ -419,6 +424,30 @@ fn migration_v2(connection: &rusqlite::Transaction) -> Result<(), String> {
     Ok(())
 }
 
+/// 迁移 v3：albums 表补远端状态列（幂等），支撑远端消失标记。
+fn migration_v3(connection: &rusqlite::Transaction) -> Result<(), String> {
+    if connection
+        .prepare("SELECT remote_status FROM albums LIMIT 0")
+        .is_err()
+    {
+        connection
+            .execute(
+                "ALTER TABLE albums ADD COLUMN remote_status TEXT NOT NULL DEFAULT 'active'",
+                [],
+            )
+            .map_err(|error| format!("升级相册远端状态列失败：{error}"))?;
+    }
+    if connection
+        .prepare("SELECT last_seen_at FROM albums LIMIT 0")
+        .is_err()
+    {
+        connection
+            .execute("ALTER TABLE albums ADD COLUMN last_seen_at INTEGER", [])
+            .map_err(|error| format!("升级相册最近发现列失败：{error}"))?;
+    }
+    Ok(())
+}
+
 /// 历史迁移：archive_dynamics 为空时从 archive_feeds.raw_json 重建动态。
 fn migrate_legacy_dynamics(connection: &rusqlite::Transaction) -> Result<(), String> {
     let dynamic_count: i64 = connection
@@ -563,6 +592,13 @@ mod tests {
             assert!(
                 dynamic_columns.iter().any(|c| c == required),
                 "archive_dynamics 缺少列 {required}"
+            );
+        }
+        let album_columns = column_names(&connection, "albums");
+        for required in ["remote_status", "last_seen_at"] {
+            assert!(
+                album_columns.iter().any(|c| c == required),
+                "albums 缺少列 {required}"
             );
         }
     }

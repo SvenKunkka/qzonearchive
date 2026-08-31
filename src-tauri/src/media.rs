@@ -105,6 +105,12 @@ pub struct MediaDownloadState {
 }
 
 impl MediaDownloadState {
+    /// 请求停止当前媒体下载任务（供登录切换等场景调用）。
+    pub(crate) fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
     pub fn new() -> Self {
         Self {
             progress: Mutex::new(MediaDownloadProgress::default()),

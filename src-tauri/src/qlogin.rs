@@ -49,6 +49,8 @@ pub struct QLoginState {
     client: Client,
     session: Mutex<Option<LoginSession>>,
     last_user_agent: Mutex<Option<String>>,
+    /// 当前已登录的账号（用于登录切换时停止任务）。
+    active_uin: Mutex<Option<String>>,
 }
 
 pub(crate) struct QzoneAuth {
@@ -70,6 +72,7 @@ impl QLoginState {
             client,
             session: Mutex::new(None),
             last_user_agent: Mutex::new(None),
+            active_uin: Mutex::new(None),
         }
     }
 
@@ -106,6 +109,21 @@ impl QLoginState {
 
     pub(crate) async fn clear_session(&self) {
         *self.session.lock().await = None;
+        *self.active_uin.lock().await = None;
+    }
+
+    /// 登录成功后登记当前账号；若与之前账号不同，先停止正在运行的任务。
+    async fn register_active_uin(&self, app: &tauri::AppHandle, uin: &str) {
+        let switched = self
+            .active_uin
+            .lock()
+            .await
+            .as_deref()
+            .is_some_and(|previous| previous != uin);
+        *self.active_uin.lock().await = Some(uin.to_owned());
+        if switched {
+            stop_running_tasks(app);
+        }
     }
 }
 
@@ -498,7 +516,10 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
 }
 
 #[tauri::command]
-pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<LoginStatus, String> {
+pub async fn poll_qr_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, QLoginState>,
+) -> Result<LoginStatus, String> {
     let mut guard = state.session.lock().await;
     let session = guard.as_mut().ok_or("请先获取登录二维码")?;
     let response = state
@@ -599,6 +620,7 @@ pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<Login
     // 预热：访问 H5 QQ 空间首页，收集完整的追踪 Cookie
     let warmup_ua = session.user_agent.clone();
     warmup_qzone_session(&state.client, &mut session.cookies, &warmup_ua, &uin).await;
+    state.register_active_uin(&app, &uin).await;
     let auth = login_credentials(session).ok_or("登录凭证不完整")?;
     Ok(LoginStatus {
         status: "success",
@@ -735,11 +757,13 @@ pub async fn check_web_login(
     let session = LoginSession {
         ptqrtoken: 0,
         cookies: cookie_map,
-        uin: Some(normalized),
+        uin: Some(normalized.clone()),
         g_tk: Some(g_tk),
         user_agent,
         ..Default::default()
     };
+
+    state.register_active_uin(&app, &normalized).await;
 
     let auth = login_credentials(&session).ok_or("登录凭证不完整")?;
 
@@ -754,6 +778,16 @@ pub async fn check_web_login(
         message: "登录成功".into(),
         auth: Some(auth),
     })
+}
+
+/// 登录账号切换时停止正在运行的归档与媒体下载任务。
+fn stop_running_tasks(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<crate::archive::ArchiveState>() {
+        state.request_cancel();
+    }
+    if let Some(state) = app.try_state::<std::sync::Arc<crate::media::MediaDownloadState>>() {
+        state.request_cancel();
+    }
 }
 
 // Cookie 注入只服务于桌面端额外的 QQ 空间 WebView。iOS/Android 的

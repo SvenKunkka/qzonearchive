@@ -273,3 +273,37 @@ npm run build              # vue-tsc + vite 前端构建
 ```
 
 > 安全红线：不在代码/日志/测试数据/提交记录中写入真实 Cookie、QQ 号或个人信息；测试用占位 UIN；日志继续脱敏 Cookie 与凭证参数。
+
+---
+
+## 9. Phase 2 完成记录（多数据源适配层与同步）
+
+**已交付**
+- `src-tauri/src/sources/mod.rs` — 数据源适配层：`source_states` 读写（每源独立游标/状态/时间/错误/统计）、
+  通用请求频率保护（每 10 分钟 300 次，`reserve_request_slot`，archive.rs 复用）、
+  `list_source_states_command` / `reset_source_state_command`。
+- `src-tauri/src/sources/albums.rs` — 相册列表源（`fcg_list_album_v3`，已确认接口）：
+  容忍式字段候选解析（与前端 RecycleBinView 一致：`albumList`/`albumId`/`name`/`num` 等），
+  写入 `albums` 表；**本次未出现的相册标记 `remote_status='remote_deleted'`，不删除本地数据**；
+  再次出现自动恢复 `active`。含 `sync_album_list_command`。
+- 互动列表（feeds）接入数据源层：归档循环每页写入 `source_states('feeds')`（游标+统计），
+  开始/完成/失败/限流/取消均更新状态。
+- **增量同步**：`start_feed_archive` 新增 `incremental` 参数；连续命中
+  `INCREMENTAL_EXISTING_THRESHOLD(100)` 条已归档内容即停止扫描更早记录；
+  首次全量（库空）不受影响；设置页可关闭（全量模式）。边界函数有单测。
+- **切换账号守卫**：`QLoginState` 追踪 `active_uin`；登录成功且账号变化时自动停止
+  归档与媒体下载任务（`request_cancel`）；归档循环内每轮校验 `qzone_auth().uin`，
+  中途切号立即停止。任务错误日志移除 `ownerUin` 字段（隐私）。
+- 数据库 v3 迁移：`albums` 表补 `remote_status` / `last_seen_at`（幂等补列）。
+- model.rs 提供远端状态工具（`mark_dynamic_remote_status` / `count_dynamic_remote_status`，
+  留待 Phase 3 审计页使用）。
+- 前端：任务页新增「数据源同步状态」区（状态/统计/同步相册列表/重置）、设置页新增
+  「增量同步」开关（默认开）。
+
+**未接入（诚实边界）**：本人说说、相册内照片、留言板、单条动态详情、原图地址——
+无本仓库实现与真实响应样本，等真实账号验证后按 `albums.rs` 模式接入
+（source_states 驱动 + 容忍解析 + 消失标记）。
+
+**验证**：`cargo fmt --check` ✅｜`cargo check`（零警告）✅｜`cargo test` 61 通过 ✅｜
+`npm run build` ✅。新增测试：source_states 读写/重置、限流窗口、相册容忍解析、
+远端消失标记（含恢复 active）、增量边界累计。

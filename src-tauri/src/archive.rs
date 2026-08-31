@@ -18,6 +18,7 @@ use crate::model::{
     comment_from_values, merge_comments, picture_url_candidates, picture_urls, video_cover_url,
     video_urls, ArchiveComment, LikeUser,
 };
+use crate::sources::{set_source_status, upsert_source_state, SOURCE_FEEDS};
 use crate::util::now;
 use crate::{db, model, qlogin::QLoginState, qzone, raw};
 
@@ -69,6 +70,12 @@ pub struct ArchiveState {
 }
 
 impl ArchiveState {
+    /// 请求停止当前归档任务（供登录切换等场景调用）。
+    pub(crate) fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.batch_cancel.store(true, Ordering::Relaxed);
+    }
+
     pub fn new() -> Self {
         Self {
             progress: Mutex::new(ArchiveProgress::default()),
@@ -290,17 +297,34 @@ fn parse_feed(feed: &Value) -> Result<ParsedFeed, String> {
     })
 }
 
+/// 一页保存的统计：saved = 写入/更新的记录数，existing = 本页已存在于库中的记录数。
+struct SavePageStats {
+    saved: u64,
+    existing: u64,
+}
+
 fn save_feed_rows(
     transaction: &rusqlite::Transaction<'_>,
     owner_uin: &str,
     feeds: &[Value],
     raw_response_id: Option<i64>,
-) -> Result<u64, String> {
+) -> Result<SavePageStats, String> {
     let mut saved = 0;
+    let mut existing = 0;
     for feed in feeds {
         // 统一模型：动态（archive_dynamics）+ 用户/评论/点赞/回复/来源行
         model::save_dynamic(transaction, owner_uin, feed, raw_response_id, "feeds")?;
         let feed = parse_feed(feed)?;
+        let already_exists: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM archive_feeds WHERE owner_uin=?1 AND feed_key=?2",
+                params![owner_uin, feed.feed_key],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("检查动态去重失败：{error}"))?;
+        if already_exists > 0 {
+            existing += 1;
+        }
         let changed = transaction.execute(
             "INSERT INTO archive_feeds
              (owner_uin, feed_key, cell_id, event_type, event_time, title, content, event_summary,
@@ -322,7 +346,7 @@ fn save_feed_rows(
         ).map_err(|error| format!("保存动态失败：{error}"))?;
         saved += changed as u64;
     }
-    Ok(saved)
+    Ok(SavePageStats { saved, existing })
 }
 
 /// 把一页响应写入 Raw 留存层（按 body SHA-256 去重）。
@@ -353,13 +377,14 @@ fn save_page(
     page: &qzone::FeedPage,
     next_cursor: Option<&str>,
     reset_checkpoint_stats: bool,
-) -> Result<u64, String> {
+) -> Result<SavePageStats, String> {
     let mut connection = open_database(app)?;
     let transaction = connection
         .transaction()
         .map_err(|error| format!("无法开始数据库事务：{error}"))?;
     let raw_id = save_page_raw(&transaction, owner_uin, page)?;
-    let saved = save_feed_rows(&transaction, owner_uin, &page.feeds, raw_id)?;
+    let stats = save_feed_rows(&transaction, owner_uin, &page.feeds, raw_id)?;
+    let saved = stats.saved;
     if let Some(cursor) = next_cursor {
         if reset_checkpoint_stats {
             transaction.execute(
@@ -388,24 +413,24 @@ fn save_page(
     transaction
         .commit()
         .map_err(|error| format!("提交归档事务失败：{error}"))?;
-    Ok(saved)
+    Ok(stats)
 }
 
 fn save_retried_page(
     app: &tauri::AppHandle,
     owner_uin: &str,
     page: &qzone::FeedPage,
-) -> Result<u64, String> {
+) -> Result<SavePageStats, String> {
     let mut connection = open_database(app)?;
     let transaction = connection
         .transaction()
         .map_err(|error| format!("无法开始重试事务：{error}"))?;
     let raw_id = save_page_raw(&transaction, owner_uin, page)?;
-    let saved = save_feed_rows(&transaction, owner_uin, &page.feeds, raw_id)?;
+    let stats = save_feed_rows(&transaction, owner_uin, &page.feeds, raw_id)?;
     transaction
         .commit()
         .map_err(|error| format!("提交重试事务失败：{error}"))?;
-    Ok(saved)
+    Ok(stats)
 }
 
 struct ArchiveCheckpoint {
@@ -416,9 +441,18 @@ struct ArchiveCheckpoint {
     updated_at: i64,
 }
 
-const ARCHIVE_RATE_WINDOW_SECONDS: i64 = 10 * 60;
-const ARCHIVE_RATE_PAGE_LIMIT: i64 = 300;
 const ARCHIVE_CURSOR_MAX_AGE_SECONDS: i64 = 10 * 60;
+/// 增量同步边界：连续命中该数量的已归档内容即停止扫描更早记录。
+const INCREMENTAL_EXISTING_THRESHOLD: u64 = 100;
+
+/// 增量同步边界累计：本页全部为已归档内容时累加，否则清零。
+fn accumulate_existing_count(existing: u64, fetched: u64, consecutive: u64) -> u64 {
+    if fetched > 0 && existing >= fetched {
+        consecutive.saturating_add(existing)
+    } else {
+        0
+    }
+}
 const ARCHIVE_SKIP_MAX_OFFSET_ADVANCE: i64 = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -606,42 +640,7 @@ fn checkpoint_is_stale(checkpoint: &ArchiveCheckpoint, current: i64) -> bool {
 
 fn reserve_archive_page(app: &tauri::AppHandle, owner_uin: &str) -> Result<Option<i64>, String> {
     let connection = open_database(app)?;
-    let current = now();
-    let state = connection.query_row(
-        "SELECT window_started_at,requested_pages FROM archive_rate_limits WHERE owner_uin=?1",
-        params![owner_uin],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    );
-    match state {
-        Ok((started_at, pages))
-            if current - started_at < ARCHIVE_RATE_WINDOW_SECONDS
-                && pages >= ARCHIVE_RATE_PAGE_LIMIT =>
-        {
-            Ok(Some(started_at + ARCHIVE_RATE_WINDOW_SECONDS))
-        }
-        Ok((started_at, _)) if current - started_at >= ARCHIVE_RATE_WINDOW_SECONDS => {
-            connection.execute(
-                "UPDATE archive_rate_limits SET window_started_at=?2,requested_pages=1 WHERE owner_uin=?1",
-                params![owner_uin, current],
-            ).map_err(|error| format!("重置归档频率窗口失败：{error}"))?;
-            Ok(None)
-        }
-        Ok(_) => {
-            connection.execute(
-                "UPDATE archive_rate_limits SET requested_pages=requested_pages+1 WHERE owner_uin=?1",
-                params![owner_uin],
-            ).map_err(|error| format!("记录归档请求频率失败：{error}"))?;
-            Ok(None)
-        }
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            connection.execute(
-                "INSERT INTO archive_rate_limits(owner_uin,window_started_at,requested_pages) VALUES (?1,?2,1)",
-                params![owner_uin, current],
-            ).map_err(|error| format!("创建归档频率窗口失败：{error}"))?;
-            Ok(None)
-        }
-        Err(error) => Err(format!("读取归档请求频率失败：{error}")),
-    }
+    crate::sources::reserve_request_slot(&connection, owner_uin)
 }
 
 fn load_checkpoint(
@@ -964,6 +963,15 @@ fn set_progress(state: &ArchiveState, update: impl FnOnce(&mut ArchiveProgress))
     }
 }
 
+/// 当前任务状态字符串（用于写入数据源同步状态）。
+fn progress_status(state: &ArchiveState) -> &'static str {
+    state
+        .progress
+        .lock()
+        .map(|progress| progress.status)
+        .unwrap_or("idle")
+}
+
 fn concise_archive_error(error: &str) -> String {
     let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = normalized.chars();
@@ -1074,6 +1082,7 @@ pub async fn start_feed_archive(
     login: tauri::State<'_, QLoginState>,
     archive: tauri::State<'_, ArchiveState>,
     interval_ms: u64,
+    incremental: bool,
 ) -> Result<ArchiveProgress, String> {
     let interval_ms = interval_ms.clamp(2_000, 30_000);
     if archive.batch_retrying.load(Ordering::Relaxed) {
@@ -1097,6 +1106,10 @@ pub async fn start_feed_archive(
     }
     archive.cancel.store(false, Ordering::Relaxed);
     let owner_uin = login.qzone_auth().await?.uin;
+    {
+        let connection = open_database(&app)?;
+        set_source_status(&connection, &owner_uin, SOURCE_FEEDS, "running", None)?;
+    }
     let saved_skip_count = unresolved_skip_count(&app, &owner_uin)?;
     set_progress(&archive, |progress| progress.skipped = saved_skip_count);
     let checkpoint = load_checkpoint(&app, &owner_uin)?;
@@ -1124,10 +1137,17 @@ pub async fn start_feed_archive(
             progress.message = format!("已恢复上次进度：{} 页，正在继续归档…", checkpoint.pages);
         });
     }
+    let mut stopped_by_incremental = false;
+    let mut consecutive_existing: u64 = 0;
     let result: Result<(), String> = async {
         loop {
             if archive.cancel.load(Ordering::Relaxed) {
                 return Ok(());
+            }
+            // 切换账号守卫：归档期间登录了其他账号则立即停止
+            let current_uin = login.qzone_auth().await?.uin;
+            if current_uin != owner_uin {
+                return Err("登录账号已切换，归档已停止".into());
             }
             if let Some(retry_at) = reserve_archive_page(&app, &owner_uin)? {
                 return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
@@ -1280,13 +1300,27 @@ pub async fn start_feed_archive(
                     },
                 )?;
             }
-            let saved = save_page(&app, &owner_uin, &page, next, reset_checkpoint_stats)?;
+            let stats = save_page(&app, &owner_uin, &page, next, reset_checkpoint_stats)?;
             reset_checkpoint_stats = false;
             let skip_count = unresolved_skip_count(&app, &owner_uin)?;
+            // feeds 数据源同步状态（游标 + 统计）
+            {
+                let connection = open_database(&app)?;
+                upsert_source_state(
+                    &connection,
+                    &owner_uin,
+                    SOURCE_FEEDS,
+                    "running",
+                    next,
+                    fetched,
+                    stats.saved,
+                    None,
+                )?;
+            }
             set_progress(&archive, |progress| {
                 progress.pages += 1;
                 progress.fetched += fetched;
-                progress.saved += saved;
+                progress.saved += stats.saved;
                 progress.skipped = skip_count;
                 progress.message = if did_skip {
                     format!(
@@ -1300,6 +1334,21 @@ pub async fn start_feed_archive(
                     )
                 };
             });
+            // 增量同步边界：本页全部是已归档内容时累计，连续达到阈值则提前停止
+            if incremental {
+                consecutive_existing =
+                    accumulate_existing_count(stats.existing, fetched, consecutive_existing);
+                if consecutive_existing >= INCREMENTAL_EXISTING_THRESHOLD {
+                    stopped_by_incremental = true;
+                    set_progress(&archive, |progress| {
+                        progress.message = format!(
+                            "增量同步完成：连续 {} 条内容已归档，停止扫描更早的记录",
+                            consecutive_existing
+                        );
+                    });
+                    return Ok(());
+                }
+            }
             if !page.has_more {
                 return Ok(());
             }
@@ -1319,7 +1368,12 @@ pub async fn start_feed_archive(
         }),
         Ok(()) => set_progress(&archive, |p| {
             p.status = "completed";
-            p.message = if p.skipped > 0 {
+            p.message = if stopped_by_incremental {
+                format!(
+                    "增量同步完成：共 {} 页，已保存 {} 条记录；连续命中已归档内容，停止扫描更早的记录",
+                    p.pages, p.saved
+                )
+            } else if p.skipped > 0 {
                 format!(
                     "归档完成，共保存 {} 条记录；另有 {} 个异常位置已跳过，可在下方单独重试",
                     p.saved, p.skipped
@@ -1339,13 +1393,13 @@ pub async fn start_feed_archive(
             p.message = "为防止接口请求过于频繁，每 10 分钟最多归档 300 页。达到限制后已安全暂停，倒计时结束即可从当前进度继续归档。".into();
         }),
         Err(_error) => set_progress(&archive, |p| {
+            // 隐私：诊断日志不记录账号 UIN 与任何凭证
             let detail = serde_json::json!({
                 "event": "qzone_archive_task_error",
                 "error": _error,
                 "pages": p.pages,
                 "fetched": p.fetched,
                 "saved": p.saved,
-                "ownerUin": owner_uin,
             });
             eprintln!(
                 "\n================ QZONE ARCHIVE TASK ERROR ================\n{}\n================ END QZONE ARCHIVE TASK ERROR ================\n",
@@ -1355,6 +1409,27 @@ pub async fn start_feed_archive(
             p.message = format!("归档失败：{}", concise_archive_error(_error));
             p.retry_at = None;
         }),
+    }
+    {
+        let connection = open_database(&app)?;
+        let status = match progress_status(&archive) {
+            "completed" => "completed",
+            "cancelled" => "cancelled",
+            "limited" => "limited",
+            _ => "error",
+        };
+        let error = if status == "error" {
+            archive.progress.lock().ok().map(|p| p.message.clone())
+        } else {
+            None
+        };
+        set_source_status(
+            &connection,
+            &owner_uin,
+            SOURCE_FEEDS,
+            status,
+            error.as_deref(),
+        )?;
     }
     let progress = archive
         .progress
@@ -2674,6 +2749,22 @@ mod tests {
 
         assert!(!checkpoint_is_stale(&checkpoint, 1_599));
         assert!(checkpoint_is_stale(&checkpoint, 1_600));
+    }
+
+    #[test]
+    fn incremental_boundary_accumulates_only_fully_existing_pages() {
+        assert_eq!(super::accumulate_existing_count(10, 10, 0), 10);
+        assert_eq!(
+            super::accumulate_existing_count(10, 10, 95),
+            105,
+            "超过阈值后可停止"
+        );
+        assert_eq!(
+            super::accumulate_existing_count(5, 10, 90),
+            0,
+            "页内包含新内容时清零"
+        );
+        assert_eq!(super::accumulate_existing_count(0, 0, 90), 0, "空页清零");
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod model;
 mod qlogin;
 mod qzone;
 mod raw;
+mod sources;
 mod util;
 
 #[tauri::command]
@@ -73,6 +74,9 @@ pub fn run() {
             media::cancel_media_download,
             media::list_media_items,
             media::get_media_stats,
+            sources::albums::sync_album_list_command,
+            sources::list_source_states_command,
+            sources::reset_source_state_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

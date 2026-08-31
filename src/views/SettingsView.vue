@@ -5,12 +5,14 @@ import { useRouter } from "vue-router";
 import Button from "primevue/button";
 import Dialog from "primevue/dialog";
 import InputNumber from "primevue/inputnumber";
+import InputSwitch from "primevue/inputswitch";
 import Select from "primevue/select";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useAuthStore } from "../stores/auth";
 import { DEFAULT_ARCHIVE_INTERVAL, MIN_ARCHIVE_INTERVAL, getArchiveInterval, resetAppSettings, setArchiveInterval } from "../utils/appSettings";
 import { getMediaDownloadMode, MEDIA_MODE_OPTIONS, setMediaDownloadMode, type MediaDownloadMode } from "../utils/mediaSettings";
+import { getIncrementalSync, setIncrementalSync } from "../utils/appSettings";
 import { deleteAllAppData } from "../utils/qzone";
 
 const router = useRouter();
@@ -18,6 +20,7 @@ const authStore = useAuthStore();
 const { loggedIn, user } = storeToRefs(authStore);
 const intervalMs = ref(getArchiveInterval());
 const mediaMode = ref<MediaDownloadMode>(getMediaDownloadMode());
+const incrementalSync = ref(getIncrementalSync());
 const privacyVisible = ref(false);
 const deleteVisible = ref(false);
 const deleting = ref(false);
@@ -39,6 +42,7 @@ function hideMissingSponsorCode(event: Event) {
 
 watch(intervalMs, (value) => { intervalMs.value = setArchiveInterval(value); });
 watch(mediaMode, (value) => { setMediaDownloadMode(value); });
+watch(incrementalSync, (value) => { setIncrementalSync(value); });
 
 function goToMediaDownload() {
   router.push("/tasks");
@@ -76,6 +80,11 @@ async function deleteEverything() {
         <small>{{ MEDIA_MODE_OPTIONS.find((item) => item.value === mediaMode)?.hint }}</small>
         <Button label="前往任务页下载" icon="pi pi-arrow-right" size="small" severity="secondary" outlined @click="goToMediaDownload" />
       </div>
+    </article>
+
+    <article class="surface-card settings-card incremental-setting">
+      <div class="settings-copy"><span class="settings-icon tone-green"><i class="pi pi-sync" /></span><div><h3>增量同步</h3><p>首次运行执行全量归档；之后只同步新增内容，遇到连续已归档内容即停止扫描更早记录。</p></div></div>
+      <InputSwitch v-model="incrementalSync" aria-label="增量同步" />
     </article>
 
     <article class="surface-card settings-card">

@@ -891,3 +891,41 @@ mod integration_tests {
         assert_eq!(entry_count, 1);
     }
 }
+
+/// 动态远端状态：active / remote_deleted / permission_changed /
+/// temporarily_unavailable / local_only。远端内容消失时只标记，不删除本地数据。
+#[allow(dead_code)] // Phase 3 审计与多数据源同步接入后启用
+pub fn mark_dynamic_remote_status(
+    conn: &rusqlite::Connection,
+    owner_uin: &str,
+    cell_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE archive_dynamics SET remote_status=?3 WHERE owner_uin=?1 AND cell_id=?2",
+        params![owner_uin, cell_id, status],
+    )
+    .map_err(|error| format!("标记动态远端状态失败：{error}"))?;
+    Ok(())
+}
+
+/// 按远端状态统计动态数量（审计页使用）。
+#[allow(dead_code)] // Phase 3 审计页使用
+pub fn count_dynamic_remote_status(
+    conn: &rusqlite::Connection,
+    owner_uin: &str,
+) -> Result<Vec<(String, i64)>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT remote_status,COUNT(*) FROM archive_dynamics
+             WHERE owner_uin=?1 GROUP BY remote_status ORDER BY 2 DESC",
+        )
+        .map_err(|error| format!("统计动态远端状态失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| format!("查询动态远端状态失败：{error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析动态远端状态失败：{error}"))
+}

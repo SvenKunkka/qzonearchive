@@ -561,7 +561,7 @@ pub async fn load_recycle_photo_preview(
 }
 
 #[tauri::command]
-pub async fn list_qzone_albums(state: tauri::State<'_, QLoginState>) -> Result<Value, String> {
+pub(crate) async fn fetch_album_list(state: &QLoginState) -> Result<Value, String> {
     let auth = state.qzone_auth().await?;
     let request_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -608,6 +608,11 @@ pub async fn list_qzone_albums(state: tauri::State<'_, QLoginState>) -> Result<V
         return Err(format!("获取相册列表失败：HTTP {status}"));
     }
     ensure_qzone_success(parse_qzone_json(&text)?)
+}
+
+#[tauri::command]
+pub async fn list_qzone_albums(state: tauri::State<'_, QLoginState>) -> Result<Value, String> {
+    fetch_album_list(&state).await
 }
 
 #[tauri::command]

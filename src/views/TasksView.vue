@@ -6,11 +6,11 @@ import ProgressBar from "primevue/progressbar";
 import Tag from "primevue/tag";
 import {
   cancelFeedArchive, cancelMediaDownload, clearResolvedArchiveSkips, getArchiveProgress, getMediaDownloadProgress, getMediaStats, listArchiveSkips,
-  pauseMediaDownload, resumeMediaDownload, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive, startMediaDownload,
-  type ArchiveProgress, type ArchiveSkipItem, type MediaDownloadProgress, type MediaStats,
+  listSourceStates, pauseMediaDownload, resetSourceState, resumeMediaDownload, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive, startMediaDownload,
+  syncAlbumList, type ArchiveProgress, type ArchiveSkipItem, type MediaDownloadProgress, type MediaStats, type SourceStateInfo,
 } from "../utils/qzone";
 import { useAuthStore } from "../stores/auth";
-import { getArchiveInterval } from "../utils/appSettings";
+import { getArchiveInterval, getIncrementalSync } from "../utils/appSettings";
 import { getMediaDownloadMode, type MediaDownloadMode } from "../utils/mediaSettings";
 
 const authStore = useAuthStore();
@@ -19,6 +19,10 @@ const progress = ref<ArchiveProgress>({ status: "idle", pages: 0, fetched: 0, sa
 const mediaProgress = ref<MediaDownloadProgress>({ status: "idle", total: 0, done: 0, failed: 0, skipped: 0, bytesDone: 0, message: "尚未开始媒体下载" });
 const mediaStats = ref<MediaStats>({ total: 0, pending: 0, done: 0, failed: 0, paused: 0, skipped: 0, bytesDone: 0, images: 0, videos: 0 });
 const mediaMode = ref<MediaDownloadMode>(getMediaDownloadMode());
+const incrementalSync = ref(getIncrementalSync());
+const sourceStates = ref<SourceStateInfo[]>([]);
+const syncingAlbumList = ref(false);
+const sourceNotice = ref("");
 const skips = ref<ArchiveSkipItem[]>([]);
 const retryingId = ref<number>();
 const skipNotice = ref("");
@@ -59,8 +63,9 @@ const filterCount = (value: (typeof filterOptions)[number]["value"]) =>
 async function refresh() {
   try { progress.value = await getArchiveProgress(); } catch { /* 保留当前状态 */ }
   if (progress.value.batchRetry) batchRetrying.value = true;
-  if (!loggedIn.value) { skips.value = []; return; }
+  if (!loggedIn.value) { skips.value = []; sourceStates.value = []; return; }
   try { skips.value = await listArchiveSkips(); } catch { /* 保留当前列表 */ }
+  try { sourceStates.value = await listSourceStates(); } catch { /* 保留当前列表 */ }
   await refreshMedia();
 }
 async function refreshMedia() {
@@ -87,10 +92,39 @@ async function startMedia(retryFailed = false) {
 async function pauseMedia() { await pauseMediaDownload(); await refreshMedia(); }
 async function resumeMedia() { beginPolling(); await resumeMediaDownload(); await refreshMedia(); }
 async function cancelMedia() { await cancelMediaDownload(); await refreshMedia(); }
+async function runAlbumSync() {
+  if (!loggedIn.value || syncingAlbumList.value) return;
+  syncingAlbumList.value = true;
+  sourceNotice.value = "";
+  try {
+    const result = await syncAlbumList();
+    sourceNotice.value = `相册列表同步完成：发现 ${result.listed} 个相册，保存 ${result.saved} 个${result.remoteMarked ? `，标记 ${result.remoteMarked} 个远端已消失` : ""}（本地数据保留）`;
+  } catch (error) {
+    sourceNotice.value = String(error);
+  } finally {
+    syncingAlbumList.value = false;
+    await refresh();
+  }
+}
+async function resetSource(source: string) {
+  try {
+    await resetSourceState(source);
+    sourceNotice.value = source === "feeds" ? "互动列表状态已重置：下次归档将全量扫描" : "相册列表状态已重置";
+    await refresh();
+  } catch (error) {
+    sourceNotice.value = String(error);
+  }
+}
+function sourceStatusText(item: SourceStateInfo) {
+  return ({ idle: "未同步", running: "同步中", completed: "已同步", error: "出错", limited: "频率保护", cancelled: "已取消" } as Record<string, string>)[item.status] ?? item.status;
+}
+function formatSourceTime(timestamp?: number) {
+  return timestamp ? new Date(timestamp * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
+}
 async function start() {
   if (!loggedIn.value) return;
   beginPolling();
-  try { progress.value = await startFeedArchive(getArchiveInterval()); }
+  try { progress.value = await startFeedArchive(getArchiveInterval(), incrementalSync.value); }
   catch { await refresh(); }
   finally { await refresh(); if (progress.value.status === "limited") beginPolling(); else { window.clearInterval(timer); timer = undefined; } }
 }
@@ -191,6 +225,27 @@ onBeforeUnmount(() => window.clearInterval(timer));
       <Button v-if="mediaStats.failed" label="重试失败" icon="pi pi-replay" severity="secondary" outlined :disabled="mediaRunning" @click="startMedia(true)" />
     </div>
     <p class="media-download-mode">当前模式：<strong>{{ mediaModeLabel }}</strong>（可在「设置」中调整）· 支持断点续传与失败重试</p>
+  </section>
+
+  <section class="surface-card task-card source-states-card">
+    <div class="section-heading"><div><p class="section-kicker">DATA SOURCES</p><h3>数据源同步状态</h3></div><Tag :value="incrementalSync ? '增量' : '全量'" :severity="incrementalSync ? 'info' : 'secondary'" /></div>
+    <p class="task-message">每种数据源独立保存同步状态、游标、最后同步时间与错误信息。远端内容消失时只做标记，不删除本地数据。</p>
+    <p v-if="sourceNotice" class="task-skip-notice"><i class="pi pi-info-circle" />{{ sourceNotice }}</p>
+    <div class="source-states-list" role="list">
+      <article v-for="item in sourceStates" :key="item.source" class="source-state-item">
+        <div class="source-state-copy">
+          <div><strong>{{ item.source === 'feeds' ? '互动列表' : '相册列表' }}</strong><Tag :value="sourceStatusText(item)" :severity="item.status === 'completed' ? 'success' : item.status === 'error' ? 'danger' : item.status === 'running' ? 'info' : item.status === 'limited' ? 'warn' : 'secondary'" /></div>
+          <small>获取 {{ item.totalFetched }} 条 · 保存 {{ item.totalSaved }} 条 · 最近同步 {{ formatSourceTime(item.lastSyncAt) }}</small>
+          <small v-if="item.cursor" class="source-state-cursor">游标：{{ item.cursor }}</small>
+          <small v-if="item.lastError" class="source-state-error">上次错误：{{ item.lastError }}</small>
+        </div>
+        <div class="source-state-actions">
+          <Button v-if="item.source === 'album_list'" label="同步相册列表" icon="pi pi-images" size="small" :loading="syncingAlbumList && item.source === 'album_list'" :disabled="syncingAlbumList || !loggedIn" @click="runAlbumSync" />
+          <Button label="重置" icon="pi pi-replay" size="small" severity="secondary" outlined :disabled="!loggedIn" @click="resetSource(item.source)" />
+        </div>
+      </article>
+      <p v-if="!sourceStates.length" class="task-skip-empty">暂无数据源同步记录。开始归档或同步相册列表后，这里会显示每种数据源的独立状态。</p>
+    </div>
   </section>
 
   <section v-if="skips.length" class="surface-card task-skips">

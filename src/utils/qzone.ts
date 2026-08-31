@@ -36,7 +36,7 @@ export interface ArchiveComment { uin?: string; nickname?: string; content: stri
 export type ArchiveCategory = "self" | "other" | "guestbook";
 export interface ArchiveMediaItem { key: string; dynamicId: number; mediaType: "photo" | "video"; pictureIndex?: number; url: string; coverUrl?: string; publishedAt: number; authorUin?: string; authorName?: string; content?: string; }
 export interface ArchiveMediaPage { items: ArchiveMediaItem[]; total: number; years: number[]; }
-export const startFeedArchive = (intervalMs: number) => invoke<ArchiveProgress>("start_feed_archive", { intervalMs });
+export const startFeedArchive = (intervalMs: number, incremental = true) => invoke<ArchiveProgress>("start_feed_archive", { intervalMs, incremental });
 export const getArchiveProgress = () => invoke<ArchiveProgress>("get_archive_progress");
 export const cancelFeedArchive = () => invoke<void>("cancel_feed_archive");
 export const listArchiveSkips = () => invoke<ArchiveSkipItem[]>("list_archive_skips");
@@ -120,3 +120,20 @@ export const cancelMediaDownload = () => invoke<void>("cancel_media_download");
 export const listMediaItems = (limit = 50, offset = 0, statusFilter?: string) =>
   invoke<MediaItemInfo[]>("list_media_items", { limit, offset, statusFilter });
 export const getMediaStats = () => invoke<MediaStats>("get_media_stats");
+
+// ---- 数据源同步状态 ----
+export interface SourceStateInfo {
+  source: string;
+  cursor: string;
+  status: string;
+  lastSyncAt?: number;
+  nextSyncAt?: number;
+  lastError?: string;
+  totalFetched: number;
+  totalSaved: number;
+  updatedAt: number;
+}
+export interface AlbumSyncResult { listed: number; saved: number; remoteMarked: number; total: number; }
+export const listSourceStates = () => invoke<SourceStateInfo[]>("list_source_states_command");
+export const resetSourceState = (source: string) => invoke<void>("reset_source_state_command", { source });
+export const syncAlbumList = () => invoke<AlbumSyncResult>("sync_album_list_command");

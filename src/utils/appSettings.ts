@@ -14,3 +14,14 @@ export function setArchiveInterval(value: number) {
 }
 
 export function resetAppSettings() { localStorage.removeItem(ARCHIVE_INTERVAL_KEY); }
+
+// 增量同步设置：首次全量归档后，后续只同步新增内容（遇到连续已归档内容即停止）。
+const INCREMENTAL_SYNC_KEY = "qzone-incremental-sync";
+
+export function getIncrementalSync(): boolean {
+  return localStorage.getItem(INCREMENTAL_SYNC_KEY) !== "false";
+}
+
+export function setIncrementalSync(value: boolean) {
+  localStorage.setItem(INCREMENTAL_SYNC_KEY, value ? "true" : "false");
+}
