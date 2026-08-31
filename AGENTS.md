@@ -56,6 +56,7 @@ Login credentials (cookies) are stored **only in the Rust backend memory** and a
 │       ├── model.rs        # Unified data model (dynamics/users/comments/likes)
 │       ├── raw.rs          # Raw response retention layer (SHA-256 dedup)
 │       ├── media.rs        # Local media download infrastructure
+│       ├── sources/        # Data source adapter layer (feeds / album_list states)
 │       └── util.rs         # Shared helpers (time, hashing, JSON)
 └── src-tauri/capabilities/ # Tauri permission configuration
 ```
@@ -165,6 +166,9 @@ Before submitting a change, run the appropriate verification:
 - Cookie values are redacted from request error diagnostics; the Raw response layer records only response bodies and non-credential metadata.
 - The database is versioned with `PRAGMA user_version` (see `src-tauri/src/db/mod.rs`); migrations are additive only and must never drop or rename existing columns.
 - Media downloads (images/videos) are recorded in `media_items` with resume, retry, rate limiting, type validation, and SHA-256 dedup; the legacy on-demand cache (`load_archived_image` / `load_archived_video`) is intentionally untouched.
+- Each data source (see `src-tauri/src/sources/`) keeps its own sync state (cursor, last sync time, error) in `source_states`; only interfaces confirmed against real responses may be added — never fabricate QQ endpoints, params, or response shapes.
+- Incremental sync stops scanning once 100 consecutive already-archived feeds are hit (first run is full); the toggle is stored on the frontend.
+- Switching the logged-in QQ account automatically cancels running archive/media tasks (account-switch guard in `qlogin.rs`).
 
 ## Disclaimer
 
