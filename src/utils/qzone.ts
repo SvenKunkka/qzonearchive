@@ -70,3 +70,53 @@ export const recoverRecycleAlbum = (pwd2sig: string, albumId: string) => invoke<
 export const recoverRecyclePhotos = (pwd2sig: string, sourceAlbumId: string, targetAlbumId: string, photoIds: string[]) =>
   invoke<Record<string, unknown>>("recover_recycle_photos", { pwd2sig, sourceAlbumId, targetAlbumId, photoIds });
 export const loadRecyclePhotoPreview = (imageUrl: string) => invoke<string>("load_recycle_photo_preview", { imageUrl });
+
+// ---- 本地媒体归档 ----
+export type MediaDownloadMode = "data-only" | "images" | "full";
+export interface MediaDownloadProgress {
+  status: "idle" | "running" | "paused" | "cancelled" | "completed" | "error";
+  total: number;
+  done: number;
+  failed: number;
+  skipped: number;
+  bytesDone: number;
+  currentUrl?: string;
+  message: string;
+}
+export interface MediaItemInfo {
+  id: number;
+  dynamicId?: number;
+  mediaKind: string;
+  remoteUrl: string;
+  localPath?: string;
+  sha256?: string;
+  sizeBytes?: number;
+  mimeType?: string;
+  downloadStatus: string;
+  downloadAttempts: number;
+  lastError?: string;
+  lastDownloadedAt?: number;
+  createdAt: number;
+}
+export interface MediaStats {
+  total: number;
+  pending: number;
+  done: number;
+  failed: number;
+  paused: number;
+  skipped: number;
+  bytesDone: number;
+  images: number;
+  videos: number;
+}
+export interface MediaSyncResult { created: number; total: number; }
+export const syncMediaItems = () => invoke<MediaSyncResult>("sync_media_items");
+export const startMediaDownload = (mode: MediaDownloadMode, retryFailed = false) =>
+  invoke<MediaDownloadProgress>("start_media_download", { mode, retryFailed });
+export const getMediaDownloadProgress = () => invoke<MediaDownloadProgress>("get_media_download_progress");
+export const pauseMediaDownload = () => invoke<void>("pause_media_download");
+export const resumeMediaDownload = () => invoke<void>("resume_media_download");
+export const cancelMediaDownload = () => invoke<void>("cancel_media_download");
+export const listMediaItems = (limit = 50, offset = 0, statusFilter?: string) =>
+  invoke<MediaItemInfo[]>("list_media_items", { limit, offset, statusFilter });
+export const getMediaStats = () => invoke<MediaStats>("get_media_stats");

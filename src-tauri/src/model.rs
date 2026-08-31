@@ -272,6 +272,7 @@ pub fn save_dynamic(
             fingerprint,
             now_value,
         ],
+        |row| row.get(0),
     )
     .map_err(|error| format!("保存原动态失败：{error}"))?;
 
@@ -338,8 +339,37 @@ fn write_feed_interactions(
         .unwrap_or(0);
     let actor_uin = text_at(feed, "/userinfo/user/uin");
     let actor_name = text_at(feed, "/userinfo/user/nickname");
-    let event_time = feed.pointer("/comm/time").and_then(Value::as_i64).unwrap_or(0);
+    let event_time = feed
+        .pointer("/comm/time")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let event_summary = text_at(feed, "/summary/summary");
+
+    // 互动参与者（点赞/评论/回复用户）统一登记到 users 表
+    if let Some(uin) = actor_uin.as_deref() {
+        upsert_user(tx, uin, actor_name.as_deref(), None)?;
+    }
+    if let Some(comments_json) = feed
+        .pointer("/original/cell_comment")
+        .filter(|value| !value.is_null())
+        .map(Value::to_string)
+    {
+        let comment = comment_from_values(
+            Some(comments_json),
+            actor_uin.clone(),
+            actor_name.clone(),
+            event_summary.clone(),
+            event_time,
+        );
+        if let Some(uin) = comment.uin.as_deref() {
+            upsert_user(tx, uin, comment.nickname.as_deref(), None)?;
+        }
+        for reply in &comment.replies {
+            if let Some(uin) = reply.uin.as_deref() {
+                upsert_user(tx, uin, reply.nickname.as_deref(), None)?;
+            }
+        }
+    }
 
     if event_type == 217 {
         if let Some(uin) = actor_uin.as_deref() {
@@ -634,7 +664,8 @@ mod tests {
     #[test]
     fn fingerprint_includes_media_urls() {
         let json = json!({"picdata":{"pic":[{"photourl":[{"url":"https://a.example/1.jpg"}]}]}});
-        let with_pic = content_fingerprint(Some("1"), 100, Some("hi"), Some(&json.to_string()), None);
+        let with_pic =
+            content_fingerprint(Some("1"), 100, Some("hi"), Some(&json.to_string()), None);
         let without_pic = content_fingerprint(Some("1"), 100, Some("hi"), None, None);
         assert_ne!(with_pic, without_pic);
     }
@@ -643,11 +674,17 @@ mod tests {
     fn extracts_picture_and_video_urls() {
         let pics = json!({"picdata":{"pic":[{"photourl":[{"url":"//a.example/1.jpg"}]},{"photourl":{"2":{"url":"https://a.example/2.png"}}}]}});
         let urls = picture_urls(Some(pics.to_string()));
-        assert_eq!(urls, vec!["https://a.example/1.jpg", "https://a.example/2.png"]);
+        assert_eq!(
+            urls,
+            vec!["https://a.example/1.jpg", "https://a.example/2.png"]
+        );
 
         let video = json!({"videourl":"https://v.example/a.mp4","videourls":{"fhd":{"url":"https://v.example/fhd.mp4"}}});
         let urls = video_urls(Some(video.to_string()));
-        assert_eq!(urls, vec!["https://v.example/a.mp4", "https://v.example/fhd.mp4"]);
+        assert_eq!(
+            urls,
+            vec!["https://v.example/a.mp4", "https://v.example/fhd.mp4"]
+        );
     }
 
     #[test]
@@ -670,5 +707,187 @@ mod tests {
         ]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].replies.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn temp_connection(name: &str) -> rusqlite::Connection {
+        let path = std::env::temp_dir().join(format!(
+            "qza-model-{}-{}-{}.sqlite3",
+            name,
+            std::process::id(),
+            crate::util::now_millis()
+        ));
+        let _ = std::fs::remove_file(&path);
+        crate::db::open_database_at(&path).unwrap()
+    }
+
+    fn sample_comment_feed() -> Value {
+        json!({
+            "comm": {"feedskey": "311_2_key", "subid": 2, "time": 1751637966},
+            "original": {
+                "cell_id": {"cellid": "mood-1"},
+                "cell_comm": {"time": 1751600000, "appid": 1, "feedskey": "1_1"},
+                "cell_summary": {"summary": "第一条动态"},
+                "cell_userinfo": {"user": {"uin": "10001", "nickname": "我"}},
+                "cell_comment": {
+                    "main_comment": {
+                        "commentid": "c-1",
+                        "content": "很棒！",
+                        "date": 1751637000,
+                        "user": {"uin": "10002", "nickname": "朋友"}
+                    }
+                }
+            },
+            "summary": {"summary": "评论了动态"},
+            "userinfo": {"user": {"uin": "10002", "nickname": "朋友"}}
+        })
+    }
+
+    #[test]
+    fn save_dynamic_writes_unified_rows() {
+        let mut connection = temp_connection("unified");
+        let transaction = connection.transaction().unwrap();
+        let feed = sample_comment_feed();
+        let id = save_dynamic(&transaction, "10001", &feed, Some(7), "feeds")
+            .unwrap()
+            .expect("应返回动态 id");
+        transaction.commit().unwrap();
+
+        // archive_dynamics 扩展列
+        let source: String = connection
+            .query_row(
+                "SELECT source FROM archive_dynamics WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "feeds");
+        let fingerprint: String = connection
+            .query_row(
+                "SELECT content_fingerprint FROM archive_dynamics WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!fingerprint.is_empty());
+
+        // dynamic_sources
+        let (matched, raw_id): (String, Option<i64>) = connection
+            .query_row(
+                "SELECT matched_by, raw_response_id FROM dynamic_sources WHERE dynamic_id=?1 AND source='feeds'",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(matched, "new");
+        assert_eq!(raw_id, Some(7));
+
+        // users
+        let nickname: String = connection
+            .query_row("SELECT nickname FROM users WHERE uin='10002'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(nickname, "朋友");
+
+        // comments
+        let (comment_id, content, uin): (Option<String>, String, Option<String>) = connection
+            .query_row(
+                "SELECT comment_id, content, uin FROM comments WHERE dynamic_id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(comment_id.as_deref(), Some("c-1"));
+        assert_eq!(content, "很棒！");
+        assert_eq!(uin.as_deref(), Some("10002"));
+
+        // 再次保存同动态 → matched_by 变为 platform_id 且不新增动态
+        let transaction2 = connection.transaction().unwrap();
+        save_dynamic(&transaction2, "10001", &feed, Some(8), "feeds").unwrap();
+        transaction2.commit().unwrap();
+        let matched: String = connection
+            .query_row(
+                "SELECT matched_by FROM dynamic_sources WHERE dynamic_id=?1 AND source='feeds'",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matched, "platform_id");
+        let dynamic_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM archive_dynamics", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(dynamic_count, 1, "重复保存不应新增动态行");
+    }
+
+    #[test]
+    fn saves_like_rows_from_like_events() {
+        let mut connection = temp_connection("likes");
+        let feed = json!({
+            "comm": {"feedskey": "217_3_key", "subid": 217, "time": 1752553379},
+            "original": {
+                "cell_id": {"cellid": "mood-2"},
+                "cell_comm": {"time": 1752500000, "appid": 1},
+                "cell_summary": {"summary": "被赞的动态"},
+                "cell_userinfo": {"user": {"uin": "10001", "nickname": "我"}}
+            },
+            "title": {"title": "赞了我"},
+            "userinfo": {"user": {"uin": "10002", "nickname": "朋友"}}
+        });
+        let transaction = connection.transaction().unwrap();
+        let id = save_dynamic(&transaction, "10001", &feed, None, "feeds")
+            .unwrap()
+            .unwrap();
+        transaction.commit().unwrap();
+        let like_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM likes WHERE dynamic_id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(like_count, 1);
+    }
+
+    #[test]
+    fn guestbook_feed_writes_guestbook_entries() {
+        let mut connection = temp_connection("guestbook");
+        let feed = json!({
+            "comm": {"feedskey": "334_1_key", "subid": 1, "time": 1752553379},
+            "original": {
+                "cell_id": {"cellid": "gb-1"},
+                "cell_comm": {"time": 1752500000, "appid": 334}
+            },
+            "summary": {"summary": "来踩踩"},
+            "userinfo": {"user": {"uin": "10002", "nickname": "访客"}}
+        });
+        let transaction = connection.transaction().unwrap();
+        let id = save_dynamic(&transaction, "10001", &feed, None, "feeds")
+            .unwrap()
+            .unwrap();
+        transaction.commit().unwrap();
+        let category: String = connection
+            .query_row(
+                "SELECT category FROM archive_dynamics WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(category, "guestbook");
+        let entry_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM guestbook_entries WHERE owner_uin='10001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entry_count, 1);
     }
 }

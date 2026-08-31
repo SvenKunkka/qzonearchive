@@ -1,6 +1,11 @@
 mod archive;
+mod db;
+mod media;
+mod model;
 mod qlogin;
 mod qzone;
+mod raw;
+mod util;
 
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
@@ -13,6 +18,7 @@ pub fn run() {
         .manage(archive::ArchiveState::new())
         .manage(qlogin::QLoginState::new())
         .manage(qzone::RecycleAuthState::default())
+        .manage(std::sync::Arc::new(media::MediaDownloadState::new()))
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
@@ -59,6 +65,14 @@ pub fn run() {
             archive::delete_archived_feeds,
             archive::clear_archived_feeds,
             archive::delete_all_app_data,
+            media::sync_media_items,
+            media::start_media_download,
+            media::get_media_download_progress,
+            media::pause_media_download,
+            media::resume_media_download,
+            media::cancel_media_download,
+            media::list_media_items,
+            media::get_media_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

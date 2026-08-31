@@ -15,6 +15,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -29,8 +30,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 
+use crate::util::now;
 use crate::{db, qlogin::QLoginState};
-use crate::util::{now, sha256_hex};
 
 // ---------------------------------------------------------------------------
 // 模式与进度
@@ -51,6 +52,7 @@ impl MediaDownloadMode {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             MediaDownloadMode::DataOnly => "data-only",
@@ -213,17 +215,15 @@ fn extension_for(bytes: &[u8], kind: &str) -> Option<&'static str> {
 }
 
 /// QQ 图片不存在占位图识别（与既有按需缓存逻辑一致）。
-fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
-    bytes.get(6..10).is_some_and(|size| {
+/// head 为文件头部字节（至少 10 字节），total_len 为完整文件长度。
+fn is_qq_missing_image_placeholder(head: &[u8], total_len: u64) -> bool {
+    head.get(6..10).is_some_and(|size| {
         let width = u16::from_le_bytes([size[0], size[1]]);
         let height = u16::from_le_bytes([size[2], size[3]]);
-        (bytes.len() == 2_038 && bytes.starts_with(b"GIF89a") && width == 340 && height == 320)
-            || (bytes.len() == 2_687
-                && bytes.starts_with(b"GIF89a")
-                && width == 340
-                && height == 320)
-            || (bytes.len() == 1_643 && bytes.starts_with(b"GIF87a") && width == 99 && height == 99)
-            || (bytes.len() == 1_547 && bytes.starts_with(b"GIF87a") && width == 98 && height == 98)
+        (total_len == 2_038 && head.starts_with(b"GIF89a") && width == 340 && height == 320)
+            || (total_len == 2_687 && head.starts_with(b"GIF89a") && width == 340 && height == 320)
+            || (total_len == 1_643 && head.starts_with(b"GIF87a") && width == 99 && height == 99)
+            || (total_len == 1_547 && head.starts_with(b"GIF87a") && width == 98 && height == 98)
     })
 }
 
@@ -273,11 +273,9 @@ struct MediaItemRow {
 }
 
 /// 从 archive_dynamics 同步媒体条目到 media_items（按 URL 去重）。
-pub fn sync_media_items(conn: &Connection, owner_uin: &str) -> Result<MediaSyncResult, String> {
+pub fn sync_media_items_db(conn: &Connection, owner_uin: &str) -> Result<MediaSyncResult, String> {
     let mut statement = conn
-        .prepare(
-            "SELECT id,pictures_json,video_json FROM archive_dynamics WHERE owner_uin=?1",
-        )
+        .prepare("SELECT id,pictures_json,video_json FROM archive_dynamics WHERE owner_uin=?1")
         .map_err(|error| format!("读取媒体同步源失败：{error}"))?;
     let rows = statement
         .query_map(params![owner_uin], |row| {
@@ -294,24 +292,12 @@ pub fn sync_media_items(conn: &Connection, owner_uin: &str) -> Result<MediaSyncR
             row.map_err(|error| format!("读取媒体同步记录失败：{error}"))?;
         let now_value = now();
         for url in crate::model::picture_urls(pictures_json) {
-            created += insert_media_item(
-                conn,
-                owner_uin,
-                Some(dynamic_id),
-                "image",
-                &url,
-                now_value,
-            )?;
+            created +=
+                insert_media_item(conn, owner_uin, Some(dynamic_id), "image", &url, now_value)?;
         }
         for url in crate::model::video_urls(video_json.clone()) {
-            created += insert_media_item(
-                conn,
-                owner_uin,
-                Some(dynamic_id),
-                "video",
-                &url,
-                now_value,
-            )?;
+            created +=
+                insert_media_item(conn, owner_uin, Some(dynamic_id), "video", &url, now_value)?;
         }
         if let Some(url) = crate::model::video_cover_url(video_json) {
             created += insert_media_item(
@@ -437,9 +423,7 @@ async fn download_item(
         }
     }
     let part_path = target_dir.join(format!("{}.part", item.id));
-    let mut resume_from = fs::metadata(&part_path)
-        .map(|meta| meta.len())
-        .unwrap_or(0);
+    let mut resume_from = fs::metadata(&part_path).map(|meta| meta.len()).unwrap_or(0);
     if resume_from > 0 {
         let _ = std::fs::OpenOptions::new().write(true).open(&part_path);
     }
@@ -460,13 +444,16 @@ async fn download_item(
         Some(_) => &[(true, true), (true, false), (false, true), (false, false)],
         None => &[(false, false)],
     };
-    for (with_cookie, with_referer) in combos {
+    for &(with_cookie, with_referer) in combos {
         if flags.should_stop() {
             return Ok(None);
         }
         let mut request = client
             .get(&item.remote_url)
-            .header(reqwest::header::USER_AGENT, auth.map(|a| a.user_agent.as_str()).unwrap_or("Mozilla/5.0"))
+            .header(
+                reqwest::header::USER_AGENT,
+                auth.map(|a| a.user_agent.as_str()).unwrap_or("Mozilla/5.0"),
+            )
             .header(
                 reqwest::header::ACCEPT,
                 if item.media_kind == "video" {
@@ -475,7 +462,10 @@ async fn download_item(
                     "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8"
                 },
             )
-            .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
+            .header(
+                reqwest::header::ACCEPT_LANGUAGE,
+                "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+            );
         if with_cookie {
             if let Some(auth) = auth {
                 request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
@@ -502,7 +492,10 @@ async fn download_item(
         // Range 不被支持时（200 而非 206）回退全量重下
         let restart = resume_from > 0
             && status == reqwest::StatusCode::OK
-            && response.headers().get(reqwest::header::CONTENT_RANGE).is_none();
+            && response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .is_none();
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
             last_error = if status == reqwest::StatusCode::FORBIDDEN {
                 "QQ 拒绝了媒体请求（HTTP 403），视频临时签名可能已过期".into()
@@ -559,9 +552,9 @@ async fn download_item(
                 let mut reader = std::io::BufReader::new(handle);
                 let mut buffer = [0u8; 64 * 1024];
                 loop {
-                    let read = reader.read(&mut buffer).map_err(|error| {
-                        format!("读取媒体临时文件失败：{error}")
-                    })?;
+                    let read = reader
+                        .read(&mut buffer)
+                        .map_err(|error| format!("读取媒体临时文件失败：{error}"))?;
                     if read == 0 {
                         break;
                     }
@@ -618,24 +611,32 @@ async fn download_item(
             continue;
         }
         let Some(extension) = extension_for(&first_bytes, &item.media_kind) else {
-            last_error = format!("返回内容不是有效的{}文件", if item.media_kind == "video" { "视频" } else { "图片" });
+            last_error = format!(
+                "返回内容不是有效的{}文件",
+                if item.media_kind == "video" {
+                    "视频"
+                } else {
+                    "图片"
+                }
+            );
             continue;
         };
-        if item.media_kind != "video" && is_qq_missing_image_placeholder(&first_bytes) {
+        if item.media_kind != "video" && is_qq_missing_image_placeholder(&first_bytes, total_bytes)
+        {
             last_error = "QQ 返回了图片不存在占位图".into();
             continue;
         }
         // 增量流式哈希（含续传部分）汇总
-        let final_hash = sha256_hex(&hasher.finalize());
+        let final_hash = hex::encode(hasher.finalize().as_slice());
         let final_path = target_dir.join(format!("{}.{}", item.id, extension));
-        fs::rename(&part_path, &final_path).map_err(|error| {
-            if final_path.exists() {
-                Ok(())
-            } else {
-                Err(format!("保存媒体归档失败：{error}"))
+        if let Err(error) = fs::rename(&part_path, &final_path) {
+            if !final_path.exists() {
+                return Err(format!("保存媒体归档失败：{error}"));
             }
-        })?;
-        let size_bytes = fs::metadata(&final_path).map(|meta| meta.len()).unwrap_or(0);
+        }
+        let size_bytes = fs::metadata(&final_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         return Ok(Some(DownloadedMeta {
             local_path: final_path.to_string_lossy().into_owned(),
             sha256: Some(final_hash),
@@ -695,7 +696,7 @@ pub async fn sync_media_items(
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
         let connection = db::open_database(&app)?;
-        sync_media_items(&connection, &owner_uin)
+        sync_media_items_db(&connection, &owner_uin)
     })
     .await
     .map_err(|error| format!("媒体同步任务异常退出：{error}"))?
@@ -705,7 +706,7 @@ pub async fn sync_media_items(
 pub async fn start_media_download(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
-    state: tauri::State<'_, MediaDownloadState>,
+    state: tauri::State<'_, std::sync::Arc<MediaDownloadState>>,
     mode: String,
     retry_failed: Option<bool>,
 ) -> Result<MediaDownloadProgress, String> {
@@ -733,7 +734,7 @@ pub async fn start_media_download(
     if mode == MediaDownloadMode::DataOnly {
         let sync = {
             let connection = db::open_database(&app)?;
-            sync_media_items(&connection, &owner_uin)?
+            sync_media_items_db(&connection, &owner_uin)?
         };
         set_progress(&state, |progress| {
             progress.status = "completed";
@@ -748,8 +749,18 @@ pub async fn start_media_download(
     let interval_ms = interval_ms_from_env_or(2_000);
     let auth = login.qzone_auth().await?;
     let media_auth = MediaRequestAuth::from_qzone(&auth);
+    let state_arc = state.inner().clone();
     tauri::async_runtime::spawn(async move {
-        run_download_task(&app, &owner_uin, &media_auth, &state, mode, retry_failed, interval_ms).await;
+        run_download_task(
+            &app,
+            &owner_uin,
+            &media_auth,
+            &state_arc,
+            mode,
+            retry_failed,
+            interval_ms,
+        )
+        .await;
     });
     Ok(progress_snapshot(&state)?)
 }
@@ -771,7 +782,7 @@ async fn run_download_task(
         // 先同步最新媒体条目
         {
             let connection = db::open_database(app)?;
-            sync_media_items(&connection, owner_uin)?;
+            sync_media_items_db(&connection, owner_uin)?;
         }
         let items = {
             let connection = db::open_database(app)?;
@@ -963,23 +974,23 @@ fn progress_snapshot(state: &MediaDownloadState) -> Result<MediaDownloadProgress
 
 #[tauri::command]
 pub fn get_media_download_progress(
-    state: tauri::State<'_, MediaDownloadState>,
+    state: tauri::State<'_, std::sync::Arc<MediaDownloadState>>,
 ) -> Result<MediaDownloadProgress, String> {
     progress_snapshot(&state)
 }
 
 #[tauri::command]
-pub fn pause_media_download(state: tauri::State<'_, MediaDownloadState>) {
+pub fn pause_media_download(state: tauri::State<'_, std::sync::Arc<MediaDownloadState>>) {
     state.paused.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
-pub fn resume_media_download(state: tauri::State<'_, MediaDownloadState>) {
+pub fn resume_media_download(state: tauri::State<'_, std::sync::Arc<MediaDownloadState>>) {
     state.paused.store(false, Ordering::Relaxed);
 }
 
 #[tauri::command]
-pub fn cancel_media_download(state: tauri::State<'_, MediaDownloadState>) {
+pub fn cancel_media_download(state: tauri::State<'_, std::sync::Arc<MediaDownloadState>>) {
     state.cancel.store(true, Ordering::Relaxed);
     state.paused.store(false, Ordering::Relaxed);
 }
@@ -999,7 +1010,7 @@ pub async fn list_media_items(
             "SELECT id,dynamic_id,media_kind,remote_url,local_path,sha256,size_bytes,mime_type,download_status,download_attempts,last_error,last_downloaded_at,created_at
              FROM media_items WHERE owner_uin=?1",
         );
-        if let Some(status) = status_filter.as_deref().filter(|s| !s.is_empty()) {
+        if status_filter.as_deref().is_some_and(|s| !s.is_empty()) {
             sql.push_str(" AND download_status=?2");
         }
         sql.push_str(" ORDER BY id DESC LIMIT ?3 OFFSET ?4");
@@ -1135,16 +1146,24 @@ mod tests {
         let routes: HashMap<String, (Vec<u8>, &'static str)> = [
             ("/png.png".to_owned(), (png_body(), "image/png")),
             ("/video.mp4".to_owned(), (mp4_body(), "video/mp4")),
-            ("/bad.html".to_owned(), (b"<html>not media</html>".to_vec(), "text/html")),
-            ("/placeholder.gif".to_owned(), (placeholder_gif(), "image/gif")),
+            (
+                "/bad.html".to_owned(),
+                (b"<html>not media</html>".to_vec(), "text/html"),
+            ),
+            (
+                "/placeholder.gif".to_owned(),
+                (placeholder_gif(), "image/gif"),
+            ),
             ("/teapot".to_owned(), (b"teapot".to_vec(), "text/plain")),
         ]
         .into_iter()
         .collect();
-        let flaky_hits = AtomicUsize::new(0);
+        let flaky_hits = std::sync::Arc::new(AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
                 let routes = routes.clone();
                 let flaky_hits = flaky_hits.clone();
                 tokio::spawn(async move {
@@ -1219,7 +1238,8 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("qza-media-tests-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("qza-media-tests-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1231,8 +1251,13 @@ mod tests {
         assert_eq!(extension_for(&mp4_body(), "video"), Some("mp4"));
         assert_eq!(extension_for(b"GIF89a.......", "image"), Some("gif"));
         assert_eq!(extension_for(b"not-an-image", "image"), None);
-        assert!(is_qq_missing_image_placeholder(&placeholder_gif()));
-        assert!(!is_qq_missing_image_placeholder(&png_body()));
+        let placeholder = placeholder_gif();
+        assert!(is_qq_missing_image_placeholder(
+            &placeholder,
+            placeholder.len() as u64
+        ));
+        let png = png_body();
+        assert!(!is_qq_missing_image_placeholder(&png, png.len() as u64));
     }
 
     #[tokio::test]
@@ -1242,7 +1267,10 @@ mod tests {
         let client = reqwest::Client::new();
         let cancel = AtomicBool::new(false);
         let paused = AtomicBool::new(false);
-        let flags = TaskFlags { cancel: &cancel, paused: &paused };
+        let flags = TaskFlags {
+            cancel: &cancel,
+            paused: &paused,
+        };
         let meta = download_item(
             &client,
             None,
@@ -1256,12 +1284,12 @@ mod tests {
         .expect("应下载成功");
         assert!(!meta.skipped);
         assert_eq!(meta.size_bytes, png_body().len() as u64);
-        assert_eq!(meta.sha256.as_deref(), Some(&crate::util::sha256_hex(&png_body())));
-        assert!(Path::new(&meta.local_path).exists());
         assert_eq!(
-            fs::read(&meta.local_path).unwrap(),
-            png_body()
+            meta.sha256.as_deref(),
+            Some(crate::util::sha256_hex(&png_body()).as_str())
         );
+        assert!(Path::new(&meta.local_path).exists());
+        assert_eq!(fs::read(&meta.local_path).unwrap(), png_body());
     }
 
     #[tokio::test]
@@ -1271,7 +1299,10 @@ mod tests {
         let client = reqwest::Client::new();
         let cancel = AtomicBool::new(false);
         let paused = AtomicBool::new(false);
-        let flags = TaskFlags { cancel: &cancel, paused: &paused };
+        let flags = TaskFlags {
+            cancel: &cancel,
+            paused: &paused,
+        };
         // 预置 part 文件：前 100 字节（模拟暂停/中断）
         let body = png_body();
         fs::write(dir.join("7.part"), &body[..100]).unwrap();
@@ -1296,7 +1327,10 @@ mod tests {
         let client = reqwest::Client::new();
         let cancel = AtomicBool::new(false);
         let paused = AtomicBool::new(false);
-        let flags = TaskFlags { cancel: &cancel, paused: &paused };
+        let flags = TaskFlags {
+            cancel: &cancel,
+            paused: &paused,
+        };
         let dir = temp_dir("reject");
         let bad = download_item(
             &client,
@@ -1338,7 +1372,10 @@ mod tests {
         let client = reqwest::Client::new();
         let cancel = AtomicBool::new(false);
         let paused = AtomicBool::new(false);
-        let flags = TaskFlags { cancel: &cancel, paused: &paused };
+        let flags = TaskFlags {
+            cancel: &cancel,
+            paused: &paused,
+        };
         let dir = temp_dir("video");
         let meta = download_item(
             &client,
@@ -1361,7 +1398,10 @@ mod tests {
         let client = reqwest::Client::new();
         let cancel = AtomicBool::new(false);
         let paused = AtomicBool::new(true); // 已暂停
-        let flags = TaskFlags { cancel: &cancel, paused: &paused };
+        let flags = TaskFlags {
+            cancel: &cancel,
+            paused: &paused,
+        };
         let dir = temp_dir("pause");
         let result = download_item(
             &client,
@@ -1379,7 +1419,8 @@ mod tests {
 
     #[tokio::test]
     async fn sync_media_items_deduplicates_by_url() {
-        let path = std::env::temp_dir().join(format!("qza-media-sync-{}.sqlite3", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("qza-media-sync-{}.sqlite3", std::process::id()));
         let _ = fs::remove_file(&path);
         let connection = crate::db::open_database_at(&path).unwrap();
         // 直接插入一条动态（含 2 张图、1 个视频）
@@ -1394,9 +1435,9 @@ mod tests {
                 [],
             )
             .unwrap();
-        let first = sync_media_items(&connection, "10001").unwrap();
+        let first = sync_media_items_db(&connection, "10001").unwrap();
         assert_eq!(first.created, 3);
-        let second = sync_media_items(&connection, "10001").unwrap();
+        let second = sync_media_items_db(&connection, "10001").unwrap();
         assert_eq!(second.created, 0, "重复同步不应新增");
         assert_eq!(second.total, 3);
         let _ = fs::remove_file(&path);

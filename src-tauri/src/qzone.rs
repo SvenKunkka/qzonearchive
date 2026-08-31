@@ -1,12 +1,12 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::header::{
     ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, COOKIE, ORIGIN, PRAGMA, REFERER, USER_AGENT,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use std::sync::{Arc, Mutex};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
-use std::sync::{Arc, Mutex};
 
 use crate::qlogin::QLoginState;
 
@@ -35,17 +35,17 @@ pub struct RecycleAuthState {
 fn pwd2sig_from_url(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
     url.query_pairs().find_map(|(key, value)| {
-        key.eq_ignore_ascii_case("pwd2sig").then(|| value.into_owned())
+        key.eq_ignore_ascii_case("pwd2sig")
+            .then(|| value.into_owned())
     })
 }
 
 #[cfg(windows)]
 fn install_recycle_request_listener(window: &tauri::WebviewWindow, state: RecycleAuthState) {
     use webview2_com::{
-        Microsoft::Web::WebView2::Win32::{
-            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, ICoreWebView2,
-        },
-        take_pwstr, WebResourceRequestedEventHandler,
+        take_pwstr,
+        Microsoft::Web::WebView2::Win32::{ICoreWebView2, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL},
+        WebResourceRequestedEventHandler,
     };
     use windows::core::{HSTRING, PWSTR};
 
@@ -60,7 +60,9 @@ fn install_recycle_request_listener(window: &tauri::WebviewWindow, state: Recycl
                 COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
             );
             let handler = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
-                let Some(args) = args else { return Ok(()); };
+                let Some(args) = args else {
+                    return Ok(());
+                };
                 let request = args.Request()?;
                 let mut raw_uri = PWSTR::null();
                 request.Uri(&mut raw_uri)?;
@@ -103,16 +105,24 @@ fn parse_qzone_json(text: &str) -> Result<Value, String> {
     // The response can be an HTML shell containing setup scripts followed by
     // a callback such as `cb({...})`. Try candidate object spans from the end
     // so setup blocks like `try { document.domain = ... }` are ignored.
-    let starts: Vec<usize> = normalized.match_indices('{').map(|(index, _)| index).collect();
+    let starts: Vec<usize> = normalized
+        .match_indices('{')
+        .map(|(index, _)| index)
+        .collect();
     let mut best_with_code: Option<(usize, Value)> = None;
     let mut fallback: Option<Value> = None;
     for &start in starts.iter().rev() {
-        let ends: Vec<usize> = normalized[start..].match_indices('}').map(|(index, _)| start + index + 1).collect();
+        let ends: Vec<usize> = normalized[start..]
+            .match_indices('}')
+            .map(|(index, _)| start + index + 1)
+            .collect();
         for &end in ends.iter().rev().take(80) {
             if let Ok(value) = serde_json::from_str::<Value>(&normalized[start..end]) {
                 let span = end - start;
                 if value.get("code").is_some()
-                    && best_with_code.as_ref().map_or(true, |(best_span, _)| span > *best_span)
+                    && best_with_code
+                        .as_ref()
+                        .map_or(true, |(best_span, _)| span > *best_span)
                 {
                     best_with_code = Some((span, value));
                 } else if fallback.is_none() {
@@ -127,7 +137,10 @@ fn parse_qzone_json(text: &str) -> Result<Value, String> {
     if let Some(value) = fallback {
         return Ok(value);
     }
-    Err(format!("解析 QQ 空间响应失败：响应片段：{}", normalized.chars().take(180).collect::<String>()))
+    Err(format!(
+        "解析 QQ 空间响应失败：响应片段：{}",
+        normalized.chars().take(180).collect::<String>()
+    ))
 }
 
 fn parse_qzone_action_response(text: &str) -> Result<Value, String> {
@@ -138,10 +151,13 @@ fn parse_qzone_action_response(text: &str) -> Result<Value, String> {
 }
 
 fn ensure_qzone_success(value: Value) -> Result<Value, String> {
-    let code = value.get("code").and_then(|code| {
-        code.as_i64()
-            .or_else(|| code.as_str().and_then(|text| text.parse().ok()))
-    }).ok_or("QQ 空间响应缺少 code 字段")?;
+    let code = value
+        .get("code")
+        .and_then(|code| {
+            code.as_i64()
+                .or_else(|| code.as_str().and_then(|text| text.parse().ok()))
+        })
+        .ok_or("QQ 空间响应缺少 code 字段")?;
     if code == 0 {
         return Ok(value);
     }
@@ -215,8 +231,11 @@ pub async fn open_recycle_password_window(
     if let Ok(mut guard) = recycle_state.pwd2sig.lock() {
         *guard = None;
     }
-    let page_url = Url::parse(&format!("https://user.qzone.qq.com/{}/photo/recycle", auth.uin))
-        .map_err(|error| format!("回收站地址无效：{error}"))?;
+    let page_url = Url::parse(&format!(
+        "https://user.qzone.qq.com/{}/photo/recycle",
+        auth.uin
+    ))
+    .map_err(|error| format!("回收站地址无效：{error}"))?;
     let bridge_script = r#"
       (() => {
         const prefix = '__QZA_PWD2SIG__';
@@ -322,9 +341,9 @@ pub async fn open_recycle_password_window(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.center();
     let window = builder
-    .initialization_script(bridge_script)
-    .build()
-    .map_err(|error| format!("打开独立密码验证窗口失败：{error}"))?;
+        .initialization_script(bridge_script)
+        .build()
+        .map_err(|error| format!("打开独立密码验证窗口失败：{error}"))?;
     #[cfg(windows)]
     install_recycle_request_listener(&window, recycle_state.inner().clone());
     for entry in auth.cookie_header.split("; ") {
@@ -397,9 +416,16 @@ pub async fn check_recycle_password(
     })()"#).ok();
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     let title = window.title().unwrap_or_default();
-    let current_url = window.url().ok().map(|url| url.to_string()).unwrap_or_default();
+    let current_url = window
+        .url()
+        .ok()
+        .map(|url| url.to_string())
+        .unwrap_or_default();
     let parsed_url = Url::parse(&current_url).ok();
-    if let Some(token) = title.strip_prefix("__QZA_PWD2SIG__").filter(|value| !value.is_empty()) {
+    if let Some(token) = title
+        .strip_prefix("__QZA_PWD2SIG__")
+        .filter(|value| !value.is_empty())
+    {
         return Ok(Some(token.to_owned()));
     }
     if let Ok(cookies) = window.cookies() {
@@ -415,12 +441,24 @@ pub async fn check_recycle_password(
     // 腾讯验证成功后通常会跳转到 callback.html，并把临时签名放在查询串或 hash 中。
     let parsed = parsed_url;
     let token_from_url = parsed.as_ref().and_then(|url| {
-        let from_pairs = |pairs: Vec<(String, String)>| pairs.into_iter().find_map(|(key, value)| {
-            (key.eq_ignore_ascii_case("pwd2sig") || key.eq_ignore_ascii_case("pwd2Sig")).then_some(value)
-        });
-        from_pairs(url.query_pairs().map(|(key, value)| (key.into_owned(), value.into_owned())).collect())
-            .or_else(|| from_pairs(url::form_urlencoded::parse(url.fragment().unwrap_or_default().as_bytes())
-                .map(|(key, value)| (key.into_owned(), value.into_owned())).collect()))
+        let from_pairs = |pairs: Vec<(String, String)>| {
+            pairs.into_iter().find_map(|(key, value)| {
+                (key.eq_ignore_ascii_case("pwd2sig") || key.eq_ignore_ascii_case("pwd2Sig"))
+                    .then_some(value)
+            })
+        };
+        from_pairs(
+            url.query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect(),
+        )
+        .or_else(|| {
+            from_pairs(
+                url::form_urlencoded::parse(url.fragment().unwrap_or_default().as_bytes())
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect(),
+            )
+        })
     });
     Ok(token_from_url.filter(|value| !value.is_empty()))
 }
@@ -484,16 +522,42 @@ pub async fn load_recycle_photo_preview(
         return Err("照片缩略图地址不是 QQ 图片域名".into());
     }
     let auth = state.qzone_auth().await?;
-    let response = state.client().get(url)
-        .header(ACCEPT, "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8")
-        .header(REFERER, format!("https://user.qzone.qq.com/{}/photo/recycle", auth.uin))
+    let response = state
+        .client()
+        .get(url)
+        .header(
+            ACCEPT,
+            "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8",
+        )
+        .header(
+            REFERER,
+            format!("https://user.qzone.qq.com/{}/photo/recycle", auth.uin),
+        )
         .header(USER_AGENT, &auth.user_agent)
         .header(COOKIE, &auth.cookie_header)
-        .send().await.map_err(|error| format!("读取照片缩略图失败：{error}"))?;
-    if !response.status().is_success() { return Err(format!("读取照片缩略图失败：HTTP {}", response.status())); }
-    let content_type = response.headers().get("content-type").and_then(|value| value.to_str().ok()).unwrap_or("image/jpeg").split(';').next().unwrap_or("image/jpeg").to_owned();
-    let bytes = response.bytes().await.map_err(|error| format!("读取照片缩略图失败：{error}"))?;
-    Ok(format!("data:{content_type};base64,{}", BASE64.encode(bytes)))
+        .send()
+        .await
+        .map_err(|error| format!("读取照片缩略图失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("读取照片缩略图失败：HTTP {}", response.status()));
+    }
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .split(';')
+        .next()
+        .unwrap_or("image/jpeg")
+        .to_owned();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取照片缩略图失败：{error}"))?;
+    Ok(format!(
+        "data:{content_type};base64,{}",
+        BASE64.encode(bytes)
+    ))
 }
 
 #[tauri::command]
@@ -661,13 +725,19 @@ pub async fn recover_recycle_album(
         .header("sec-fetch-dest", "empty")
         .header("sec-fetch-mode", "cors")
         .header("sec-fetch-site", "same-origin")
-        .header("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
+        .header(
+            "content-type",
+            "application/x-www-form-urlencoded;charset=UTF-8",
+        )
         .form(&form)
         .send()
         .await
         .map_err(|error| format!("恢复相册失败：{error}"))?;
     let status = response.status();
-    let text = response.text().await.map_err(|error| format!("读取恢复相册响应失败：{error}"))?;
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取恢复相册响应失败：{error}"))?;
     if !status.is_success() {
         return Err(format!("恢复相册失败：HTTP {status}"));
     }
@@ -676,7 +746,9 @@ pub async fn recover_recycle_album(
     let succeeded = data.get("succ_num").and_then(Value::as_u64).unwrap_or(0);
     let failed = data.get("fail_num").and_then(Value::as_u64).unwrap_or(0);
     if succeeded != 1 || failed != 0 {
-        return Err(format!("相册恢复未完成：成功 {succeeded} 个，失败 {failed} 个"));
+        return Err(format!(
+            "相册恢复未完成：成功 {succeeded} 个，失败 {failed} 个"
+        ));
     }
     Ok(parsed)
 }
@@ -693,8 +765,12 @@ pub async fn recover_recycle_photos(
         return Err("请先选择需要恢复的照片".into());
     }
     let auth = state.qzone_auth().await?;
-    if source_album_id.trim().is_empty() { return Err("照片缺少回收站来源相册 ID".into()); }
-    if target_album_id.trim().is_empty() { return Err("照片缺少恢复目标相册 ID".into()); }
+    if source_album_id.trim().is_empty() {
+        return Err("照片缺少回收站来源相册 ID".into());
+    }
+    if target_album_id.trim().is_empty() {
+        return Err("照片缺少恢复目标相册 ID".into());
+    }
     let pic_list = format!("{}@{}", source_album_id, photo_ids.join("_"));
     let g_tk = auth.g_tk.to_string();
     let qzreferrer = format!("https://user.qzone.qq.com/{}", auth.uin);
@@ -704,16 +780,16 @@ pub async fn recover_recycle_photos(
         // Destination album and recycle-bin source group are different IDs.
         ("albumId", target_album_id.as_str()),
         ("picList", pic_list.as_str()),
-            ("pwd2sig", pwd2sig.as_str()),
-            ("format", "fs"),
-            ("inCharset", "utf-8"),
-            ("outCharset", "utf-8"),
-            ("notice", "0"),
-            ("callbackFun", "_Callback"),
-            ("plat", "qzone"),
-            ("source", "qzone"),
-            ("appid", "4"),
-            ("qzreferrer", qzreferrer.as_str()),
+        ("pwd2sig", pwd2sig.as_str()),
+        ("format", "fs"),
+        ("inCharset", "utf-8"),
+        ("outCharset", "utf-8"),
+        ("notice", "0"),
+        ("callbackFun", "_Callback"),
+        ("plat", "qzone"),
+        ("source", "qzone"),
+        ("appid", "4"),
+        ("qzreferrer", qzreferrer.as_str()),
     ];
     let response = state
         .client()
@@ -734,7 +810,10 @@ pub async fn recover_recycle_photos(
         .header("sec-fetch-dest", "empty")
         .header("sec-fetch-mode", "cors")
         .header("sec-fetch-site", "same-origin")
-        .header("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
+        .header(
+            "content-type",
+            "application/x-www-form-urlencoded;charset=UTF-8",
+        )
         .form(&form)
         .send()
         .await
@@ -905,6 +984,17 @@ pub struct FeedPage {
     pub(crate) feeds: Vec<Value>,
     pub(crate) attach_info: Option<String>,
     pub(crate) has_more: bool,
+    // 原始响应元数据（仅后端使用，不序列化给前端）
+    #[serde(skip)]
+    pub(crate) raw_body: String,
+    #[serde(skip)]
+    pub(crate) raw_url: String,
+    #[serde(skip)]
+    pub(crate) raw_query: Option<Value>,
+    #[serde(skip)]
+    pub(crate) raw_status: u16,
+    #[serde(skip)]
+    pub(crate) raw_content_type: Option<String>,
 }
 
 fn parse_feed_page(value: Value) -> Result<FeedPage, String> {
@@ -935,7 +1025,33 @@ fn parse_feed_page(value: Value) -> Result<FeedPage, String> {
         feeds,
         attach_info,
         has_more,
+        raw_body: String::new(),
+        raw_url: String::new(),
+        raw_query: None,
+        raw_status: 0,
+        raw_content_type: None,
     })
+}
+
+/// 把一次成功响应附到 FeedPage 上（供 Raw 留存层使用）。
+fn page_with_raw(
+    mut page: FeedPage,
+    url: &str,
+    query: &[(&str, String)],
+    status: u16,
+    content_type: Option<&str>,
+    body: &str,
+) -> FeedPage {
+    let query_map: serde_json::Map<String, Value> = query
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), Value::String(value.clone())))
+        .collect();
+    page.raw_body = body.to_owned();
+    page.raw_url = url.to_owned();
+    page.raw_query = (!query_map.is_empty()).then(|| Value::Object(query_map));
+    page.raw_status = status;
+    page.raw_content_type = content_type.map(str::to_owned);
+    page
 }
 
 pub(crate) async fn fetch_feeds(
@@ -1007,7 +1123,10 @@ async fn fetch_feeds_with_attempts(
         match client
             .get(FEEDS_URL)
             .header(ACCEPT, "application/json")
-            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5")
+            .header(
+                ACCEPT_LANGUAGE,
+                "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+            )
             .header(CACHE_CONTROL, "no-cache")
             .header(PRAGMA, "no-cache")
             .header(ORIGIN, "https://h5.qzone.qq.com")
@@ -1166,7 +1285,20 @@ async fn fetch_feeds_with_attempts(
         }
     };
     match parse_feed_page(value) {
-        Ok(page) => Ok(page),
+        Ok(page) => {
+            let content_type = headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            Ok(page_with_raw(
+                page,
+                &request_url,
+                &query,
+                status.as_u16(),
+                content_type.as_deref(),
+                &body,
+            ))
+        }
         Err(error) => {
             log_feed_request_error(
                 "parse_api_response",
@@ -1199,7 +1331,10 @@ pub async fn fetch_more_feeds(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_qzone_success, feed_error_can_skip, parse_feed_page, parse_qzone_json, retryable_response_reason, FEEDS_URL};
+    use super::{
+        ensure_qzone_success, feed_error_can_skip, parse_feed_page, parse_qzone_json,
+        retryable_response_reason, FEEDS_URL,
+    };
     use reqwest::StatusCode;
     use serde_json::json;
 
@@ -1261,7 +1396,10 @@ mod tests {
 
     #[test]
     fn parses_qzone_callback_response() {
-        let value = parse_qzone_json(r#"<script>frameElement.callback({"code":0,"data":{"succ_num":1}});</script>"#).unwrap();
+        let value = parse_qzone_json(
+            r#"<script>frameElement.callback({"code":0,"data":{"succ_num":1}});</script>"#,
+        )
+        .unwrap();
         assert_eq!(value["code"], 0);
         assert_eq!(value["data"]["succ_num"], 1);
         assert!(ensure_qzone_success(value).is_ok());

@@ -51,7 +51,12 @@ Login credentials (cookies) are stored **only in the Rust backend memory** and a
 │       ├── lib.rs          # Tauri command registration
 │       ├── qlogin.rs       # QQ login (QR code + web)
 │       ├── qzone.rs        # QQ Zone API client
-│       └── archive.rs      # Archiving engine + database
+│       ├── archive.rs      # Archiving engine (feeds) + queries + export
+│       ├── db/mod.rs       # Versioned SQLite migrations (PRAGMA user_version)
+│       ├── model.rs        # Unified data model (dynamics/users/comments/likes)
+│       ├── raw.rs          # Raw response retention layer (SHA-256 dedup)
+│       ├── media.rs        # Local media download infrastructure
+│       └── util.rs         # Shared helpers (time, hashing, JSON)
 └── src-tauri/capabilities/ # Tauri permission configuration
 ```
 
@@ -157,6 +162,9 @@ Before submitting a change, run the appropriate verification:
 - QQ video signatures have an expiration time; expired video URLs require re-archiving to refresh.
 - Data is saved in the application data directory by default; it is recommended to regularly back up important materials separately.
 - Login credentials (cookies) are kept in Rust backend memory only — never log them, write them to disk, or expose them through Tauri commands.
+- Cookie values are redacted from request error diagnostics; the Raw response layer records only response bodies and non-credential metadata.
+- The database is versioned with `PRAGMA user_version` (see `src-tauri/src/db/mod.rs`); migrations are additive only and must never drop or rename existing columns.
+- Media downloads (images/videos) are recorded in `media_items` with resume, retry, rate limiting, type validation, and SHA-256 dedup; the legacy on-demand cache (`load_archived_image` / `load_archived_video`) is intentionally untouched.
 
 ## Disclaimer
 

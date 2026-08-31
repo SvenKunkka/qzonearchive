@@ -13,6 +13,7 @@ pub fn now() -> i64 {
 }
 
 /// 当前 Unix 毫秒。
+#[allow(dead_code)]
 pub fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -35,6 +36,7 @@ pub fn text_at(value: &Value, pointer: &str) -> Option<String> {
 }
 
 /// 从 JSON 中读取 i64（含字符串形式）。
+#[allow(dead_code)]
 pub fn int_at(value: &Value, pointer: &str) -> Option<i64> {
     value.pointer(pointer).and_then(|value| match value {
         Value::Number(number) => number.as_i64(),
@@ -58,8 +60,14 @@ mod tests {
 
     #[test]
     fn hashes_are_stable_and_lowercase_hex() {
-        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

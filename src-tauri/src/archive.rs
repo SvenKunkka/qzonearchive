@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection};
@@ -13,9 +14,12 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::Manager;
 
-use crate::model::{comment_from_values, merge_comments, picture_url_candidates, picture_urls, video_cover_url, video_urls, ArchiveComment, ArchiveReply, LikeUser};
+use crate::model::{
+    comment_from_values, merge_comments, picture_url_candidates, picture_urls, video_cover_url,
+    video_urls, ArchiveComment, LikeUser,
+};
 use crate::util::now;
-use crate::{db, qlogin::QLoginState, qzone, raw};
+use crate::{db, model, qlogin::QLoginState, qzone, raw};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -783,7 +787,10 @@ pub async fn load_archived_image(
                     reqwest::header::ACCEPT,
                     "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
                 )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
+                .header(
+                    reqwest::header::ACCEPT_LANGUAGE,
+                    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+                );
             if with_cookie {
                 request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
             }
@@ -837,6 +844,7 @@ pub async fn load_archived_image(
     Err(format!("所有 QQ 图片地址均加载失败：{last_error}"))
 }
 
+#[tauri::command]
 pub async fn load_archived_video(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
@@ -892,7 +900,10 @@ pub async fn load_archived_video(
                     reqwest::header::ACCEPT,
                     "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
                 )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
+                .header(
+                    reqwest::header::ACCEPT_LANGUAGE,
+                    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+                );
             if with_cookie {
                 request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
             }
@@ -1269,7 +1280,7 @@ pub async fn start_feed_archive(
                     },
                 )?;
             }
-            let saved = save_page(&app, &owner_uin, &page.feeds, next, reset_checkpoint_stats)?;
+            let saved = save_page(&app, &owner_uin, &page, next, reset_checkpoint_stats)?;
             reset_checkpoint_stats = false;
             let skip_count = unresolved_skip_count(&app, &owner_uin)?;
             set_progress(&archive, |progress| {
@@ -1513,7 +1524,8 @@ pub async fn retry_all_archive_skips(
                 });
             }
             Err(error) => {
-                if error.starts_with("请求频率保护中") || error.starts_with("归档任务运行中") {
+                if error.starts_with("请求频率保护中") || error.starts_with("归档任务运行中")
+                {
                     break;
                 }
                 result.failed += 1;
@@ -1580,7 +1592,7 @@ async fn retry_single_skip(
     match qzone::fetch_feeds(login, "2", Some(&cursor)).await {
         Ok(page) => {
             let recovered_records = page.feeds.len() as u64;
-            save_retried_page(app, owner_uin, &page.feeds)?;
+            save_retried_page(app, owner_uin, &page)?;
             let connection = open_database(app)?;
             connection
                 .execute(
@@ -1831,18 +1843,20 @@ pub async fn get_archived_feed(
          WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
         )
         .map_err(|error| format!("准备评论查询失败：{error}"))?;
-    item.comments = merge_comments(comments
-        .query_map(params![item.owner_uin, item.cell_id], |row| {
-            Ok(comment_from_values(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .map_err(|error| format!("查询动态评论失败：{error}"))?
-        .filter_map(Result::ok));
+    item.comments = merge_comments(
+        comments
+            .query_map(params![item.owner_uin, item.cell_id], |row| {
+                Ok(comment_from_values(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .map_err(|error| format!("查询动态评论失败：{error}"))?
+            .filter_map(Result::ok),
+    );
     drop(comments);
     let mut likes_stmt = connection
         .prepare(
@@ -2143,15 +2157,15 @@ pub async fn count_archived_feeds(
     validate_category(&category)?;
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
-    let connection = open_database(&app)?;
-    connection
-        .query_row(
-            "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND category=?2",
-            params![owner_uin, category],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count.max(0) as u64)
-        .map_err(|error| format!("统计归档数量失败：{error}"))
+        let connection = open_database(&app)?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND category=?2",
+                params![owner_uin, category],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| format!("统计归档数量失败：{error}"))
     })
     .await
     .map_err(|error| format!("归档统计任务异常退出：{error}"))?

@@ -5,15 +5,20 @@ import Button from "primevue/button";
 import ProgressBar from "primevue/progressbar";
 import Tag from "primevue/tag";
 import {
-  cancelFeedArchive, clearResolvedArchiveSkips, getArchiveProgress, listArchiveSkips, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive,
-  type ArchiveProgress, type ArchiveSkipItem,
+  cancelFeedArchive, cancelMediaDownload, clearResolvedArchiveSkips, getArchiveProgress, getMediaDownloadProgress, getMediaStats, listArchiveSkips,
+  pauseMediaDownload, resumeMediaDownload, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive, startMediaDownload,
+  type ArchiveProgress, type ArchiveSkipItem, type MediaDownloadProgress, type MediaStats,
 } from "../utils/qzone";
 import { useAuthStore } from "../stores/auth";
 import { getArchiveInterval } from "../utils/appSettings";
+import { getMediaDownloadMode, type MediaDownloadMode } from "../utils/mediaSettings";
 
 const authStore = useAuthStore();
 const { loggedIn } = storeToRefs(authStore);
 const progress = ref<ArchiveProgress>({ status: "idle", pages: 0, fetched: 0, saved: 0, skipped: 0, message: "尚未开始归档" });
+const mediaProgress = ref<MediaDownloadProgress>({ status: "idle", total: 0, done: 0, failed: 0, skipped: 0, bytesDone: 0, message: "尚未开始媒体下载" });
+const mediaStats = ref<MediaStats>({ total: 0, pending: 0, done: 0, failed: 0, paused: 0, skipped: 0, bytesDone: 0, images: 0, videos: 0 });
+const mediaMode = ref<MediaDownloadMode>(getMediaDownloadMode());
 const skips = ref<ArchiveSkipItem[]>([]);
 const retryingId = ref<number>();
 const skipNotice = ref("");
@@ -56,8 +61,32 @@ async function refresh() {
   if (progress.value.batchRetry) batchRetrying.value = true;
   if (!loggedIn.value) { skips.value = []; return; }
   try { skips.value = await listArchiveSkips(); } catch { /* 保留当前列表 */ }
+  await refreshMedia();
+}
+async function refreshMedia() {
+  if (!loggedIn.value) { mediaProgress.value = { status: "idle", total: 0, done: 0, failed: 0, skipped: 0, bytesDone: 0, message: "尚未开始媒体下载" }; return; }
+  try { mediaProgress.value = await getMediaDownloadProgress(); } catch { /* 保留当前状态 */ }
+  try { mediaStats.value = await getMediaStats(); } catch { /* 保留当前统计 */ }
 }
 function beginPolling() { window.clearInterval(timer); timer = window.setInterval(() => { currentTime.value = Date.now(); void refresh(); }, 600); }
+const mediaRunning = computed(() => mediaProgress.value.status === "running");
+const mediaPaused = computed(() => mediaProgress.value.status === "paused");
+const mediaModeLabel = computed(() => ({ "data-only": "仅保存数据", images: "下载图片", full: "完整下载" }[mediaMode.value]));
+const mediaProgressPercent = computed(() => mediaProgress.value.total > 0 ? Math.min(100, Math.round((mediaProgress.value.done + mediaProgress.value.failed + mediaProgress.value.skipped) / mediaProgress.value.total * 100)) : 0);
+const mediaBytesText = computed(() => {
+  const bytes = mediaStats.value.bytesDone;
+  return bytes >= 1024 * 1024 * 1024 ? `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB` : bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${bytes} B`;
+});
+async function startMedia(retryFailed = false) {
+  if (!loggedIn.value) return;
+  beginPolling();
+  try { mediaProgress.value = await startMediaDownload(mediaMode.value, retryFailed); }
+  catch { await refreshMedia(); }
+  finally { await refreshMedia(); }
+}
+async function pauseMedia() { await pauseMediaDownload(); await refreshMedia(); }
+async function resumeMedia() { beginPolling(); await resumeMediaDownload(); await refreshMedia(); }
+async function cancelMedia() { await cancelMediaDownload(); await refreshMedia(); }
 async function start() {
   if (!loggedIn.value) return;
   beginPolling();
@@ -129,7 +158,7 @@ function offsetLabel(item: ArchiveSkipItem) {
   const end = item.cursorOffset + item.offsetAdvance - 1;
   return end > item.cursorOffset ? `${item.cursorOffset}–${end}` : String(item.cursorOffset);
 }
-onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value || batchRetrying.value || batchProgress.value) beginPolling(); });
+onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value || batchRetrying.value || batchProgress.value || mediaRunning.value || mediaPaused.value) beginPolling(); });
 onBeforeUnmount(() => window.clearInterval(timer));
 </script>
 
@@ -147,6 +176,21 @@ onBeforeUnmount(() => window.clearInterval(timer));
       <Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" />
       <Button v-if="batchRetrying" :label="batchStopping ? '正在停止…' : '停止重试'" icon="pi pi-stop" severity="warn" outlined :loading="batchStopping" :disabled="batchStopping" @click="stopBatchRetry" />
     </div>
+  </section>
+
+  <section class="surface-card task-card media-download-card">
+    <div class="section-heading"><div><p class="section-kicker">MEDIA ARCHIVE</p><h3>本地媒体归档</h3></div><Tag :value="mediaPaused ? '已暂停' : mediaRunning ? '下载中' : mediaProgress.status === 'completed' ? '已完成' : mediaProgress.status === 'error' ? '失败' : mediaProgress.status === 'cancelled' ? '已取消' : '未开始'" :severity="mediaPaused ? 'warn' : mediaRunning ? 'info' : mediaProgress.status === 'completed' ? 'success' : mediaProgress.status === 'error' ? 'danger' : 'secondary'" /></div>
+    <p class="task-message">{{ mediaProgress.message }}</p>
+    <div v-if="mediaRunning || mediaPaused" class="media-download-progress"><ProgressBar :value="mediaProgressPercent" :show-value="false" style="height: 7px" /><span>{{ mediaProgress.done }} / {{ mediaProgress.total }} · 失败 {{ mediaProgress.failed }} · 跳过 {{ mediaProgress.skipped }}</span></div>
+    <div class="media-download-stats"><div><span>待下载</span><strong>{{ mediaStats.pending }}</strong></div><div><span>已下载</span><strong>{{ mediaStats.done }}</strong></div><div><span>图片/视频</span><strong>{{ mediaStats.images }} / {{ mediaStats.videos }}</strong></div><div><span>本地占用</span><strong>{{ mediaBytesText }}</strong></div></div>
+    <div class="task-actions media-download-actions">
+      <Button :label="mediaRunning ? '下载中…' : mediaPaused ? '继续下载' : '开始媒体下载'" icon="pi pi-cloud-download" :disabled="mediaRunning || !loggedIn" @click="startMedia()" />
+      <Button v-if="mediaRunning" label="暂停" icon="pi pi-pause" severity="warn" outlined @click="pauseMedia" />
+      <Button v-if="mediaPaused" label="继续" icon="pi pi-play" severity="secondary" outlined @click="resumeMedia" />
+      <Button v-if="mediaRunning || mediaPaused" label="取消" icon="pi pi-times" severity="danger" outlined @click="cancelMedia" />
+      <Button v-if="mediaStats.failed" label="重试失败" icon="pi pi-replay" severity="secondary" outlined :disabled="mediaRunning" @click="startMedia(true)" />
+    </div>
+    <p class="media-download-mode">当前模式：<strong>{{ mediaModeLabel }}</strong>（可在「设置」中调整）· 支持断点续传与失败重试</p>
   </section>
 
   <section v-if="skips.length" class="surface-card task-skips">

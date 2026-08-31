@@ -11,29 +11,32 @@
 
 use std::path::PathBuf;
 
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use tauri::Manager;
 
 use crate::model;
-use crate::util::now;
 
+#[allow(dead_code)]
 pub const SCHEMA_VERSION: i64 = 2;
 
 pub struct Migration {
     pub version: i64,
     pub name: &'static str,
-    pub apply: fn(&mut Connection) -> Result<(), String>,
+    pub apply: fn(&rusqlite::Transaction) -> Result<(), String>,
 }
 
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "v1_legacy_schema",
-    apply: migration_v1,
-}, Migration {
-    version: 2,
-    name: "v2_unified_model",
-    apply: migration_v2,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "v1_legacy_schema",
+        apply: migration_v1,
+    },
+    Migration {
+        version: 2,
+        name: "v2_unified_model",
+        apply: migration_v2,
+    },
+];
 
 pub fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
@@ -51,8 +54,8 @@ pub fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
 
 /// 打开指定路径数据库并执行未完成的迁移（测试入口）。
 pub fn open_database_at(path: &std::path::Path) -> Result<Connection, String> {
-    let mut connection = Connection::open(path)
-        .map_err(|error| format!("无法打开归档数据库：{error}"))?;
+    let mut connection =
+        Connection::open(path).map_err(|error| format!("无法打开归档数据库：{error}"))?;
     connection
         .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
@@ -85,7 +88,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         let transaction = connection
             .transaction()
             .map_err(|error| format!("开始数据库迁移失败：{error}"))?;
-        (migration.apply)(&mut *transaction)
+        (migration.apply)(&transaction)
             .map_err(|error| format!("数据库迁移 {} 失败：{error}", migration.name))?;
         transaction
             .pragma_update(None, "user_version", migration.version)
@@ -98,7 +101,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
 }
 
 /// 迁移 v1：存量 schema + 历史数据迁移（与旧版 open_database 行为等价）。
-fn migration_v1(connection: &mut Connection) -> Result<(), String> {
+fn migration_v1(connection: &rusqlite::Transaction) -> Result<(), String> {
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS archive_feeds (
@@ -206,7 +209,7 @@ fn migration_v1(connection: &mut Connection) -> Result<(), String> {
 }
 
 /// 迁移 v2：统一模型扩展（Raw 层、数据源状态、用户、媒体、互动分表等）。
-fn migration_v2(connection: &mut Connection) -> Result<(), String> {
+fn migration_v2(connection: &rusqlite::Transaction) -> Result<(), String> {
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS source_states (
@@ -417,7 +420,7 @@ fn migration_v2(connection: &mut Connection) -> Result<(), String> {
 }
 
 /// 历史迁移：archive_dynamics 为空时从 archive_feeds.raw_json 重建动态。
-fn migrate_legacy_dynamics(connection: &mut Connection) -> Result<(), String> {
+fn migrate_legacy_dynamics(connection: &rusqlite::Transaction) -> Result<(), String> {
     let dynamic_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM archive_dynamics", [], |row| {
             row.get(0)
@@ -440,21 +443,16 @@ fn migrate_legacy_dynamics(connection: &mut Connection) -> Result<(), String> {
     if legacy.is_empty() {
         return Ok(());
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|error| format!("开始旧归档迁移失败：{error}"))?;
     for (owner_uin, raw_json) in legacy {
         if let Ok(feed) = serde_json::from_str::<serde_json::Value>(&raw_json) {
-            model::save_dynamic(&transaction, &owner_uin, &feed, None, "feeds")?;
+            model::save_dynamic(connection, &owner_uin, &feed, None, "feeds")?;
         }
     }
-    transaction
-        .commit()
-        .map_err(|error| format!("提交旧归档迁移失败：{error}"))
+    Ok(())
 }
 
 /// 历史迁移：补全 archive_dynamics.category（旧数据 category 为空）。
-fn migrate_dynamic_categories(connection: &mut Connection) -> Result<(), String> {
+fn migrate_dynamic_categories(connection: &rusqlite::Transaction) -> Result<(), String> {
     let pending: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM archive_dynamics WHERE category=''",
@@ -476,21 +474,16 @@ fn migrate_dynamic_categories(connection: &mut Connection) -> Result<(), String>
             .map_err(|error| format!("查询待分类归档失败：{error}"))?;
         rows.filter_map(Result::ok).collect::<Vec<_>>()
     };
-    let transaction = connection
-        .transaction()
-        .map_err(|error| format!("开始归档分类迁移失败：{error}"))?;
     for (owner_uin, raw_json) in feeds {
         if let Ok(feed) = serde_json::from_str::<serde_json::Value>(&raw_json) {
-            model::save_dynamic(&transaction, &owner_uin, &feed, None, "feeds")?;
+            model::save_dynamic(connection, &owner_uin, &feed, None, "feeds")?;
         }
     }
-    transaction.execute(
+    connection.execute(
         "UPDATE archive_dynamics SET category=CASE WHEN author_uin=owner_uin THEN 'self' ELSE 'other' END WHERE category=''",
         [],
     ).map_err(|error| format!("补全归档分类失败：{error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("提交归档分类迁移失败：{error}"))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -525,7 +518,9 @@ mod tests {
         let mut statement = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap();
-        let rows = statement.query_map([], |row| row.get::<_, String>(1)).unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap();
         rows.filter_map(Result::ok).collect()
     }
 
@@ -538,12 +533,37 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         let tables = table_names(&connection);
-        for required in ["archive_feeds", "archive_dynamics", "raw_responses", "media_items", "source_states", "users", "comments", "likes", "replies", "guestbook_entries", "albums", "album_photos", "archive_settings", "dynamic_sources", "merge_logs"] {
+        for required in [
+            "archive_feeds",
+            "archive_dynamics",
+            "raw_responses",
+            "media_items",
+            "source_states",
+            "users",
+            "comments",
+            "likes",
+            "replies",
+            "guestbook_entries",
+            "albums",
+            "album_photos",
+            "archive_settings",
+            "dynamic_sources",
+            "merge_logs",
+        ] {
             assert!(tables.iter().any(|t| t == required), "缺少表 {required}");
         }
         let dynamic_columns = column_names(&connection, "archive_dynamics");
-        for required in ["source", "content_fingerprint", "remote_status", "first_seen_at", "last_seen_at"] {
-            assert!(dynamic_columns.iter().any(|c| c == required), "archive_dynamics 缺少列 {required}");
+        for required in [
+            "source",
+            "content_fingerprint",
+            "remote_status",
+            "first_seen_at",
+            "last_seen_at",
+        ] {
+            assert!(
+                dynamic_columns.iter().any(|c| c == required),
+                "archive_dynamics 缺少列 {required}"
+            );
         }
     }
 
@@ -552,7 +572,12 @@ mod tests {
         let path = temp_db_path("idempotent");
         {
             let connection = open_database_at(&path).unwrap();
-            connection.execute("INSERT INTO archive_settings(key,value,updated_at) VALUES ('a','b',1)", []).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO archive_settings(key,value,updated_at) VALUES ('a','b',1)",
+                    [],
+                )
+                .unwrap();
         }
         let connection = open_database_at(&path).unwrap();
         let version: i64 = connection
@@ -629,7 +654,9 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         let count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM archive_dynamics", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM archive_dynamics", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1);
         let content: String = connection
@@ -661,7 +688,11 @@ mod tests {
     #[test]
     fn migration_list_is_ordered_and_contiguous() {
         for (index, migration) in MIGRATIONS.iter().enumerate() {
-            assert_eq!(migration.version as usize, index + 1, "版本必须从 1 开始连续");
+            assert_eq!(
+                migration.version as usize,
+                index + 1,
+                "版本必须从 1 开始连续"
+            );
         }
     }
 

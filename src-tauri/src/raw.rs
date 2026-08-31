@@ -63,10 +63,19 @@ pub fn save_raw(conn: &Connection, record: &RawRecord) -> Result<i64, String> {
 
 /// 剔除查询参数中的凭证类字段（Cookie/skey/token/sig 等）。
 /// 仅用于日志与诊断；Raw 库中仍保留完整参数以便复现请求。
+#[allow(dead_code)]
 pub fn redact_query_for_diagnostic(query: &[(String, String)]) -> Value {
     const SENSITIVE_KEYS: &[&str] = &[
-        "skey", "p_skey", "pt4_token", "pwd2sig", "pwd2Sig", "sig", "token", "ptsigx",
-        "login_sig", "qrsig",
+        "skey",
+        "p_skey",
+        "pt4_token",
+        "pwd2sig",
+        "pwd2Sig",
+        "sig",
+        "token",
+        "ptsigx",
+        "login_sig",
+        "qrsig",
     ];
     let map: serde_json::Map<String, Value> = query
         .iter()
@@ -104,5 +113,77 @@ mod tests {
         assert_eq!(redacted["uin"], "10001");
         assert_eq!(redacted["p_skey"], "[redacted]");
         assert_eq!(redacted["res_attach"], "cursor");
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn temp_db(name: &str) -> Connection {
+        let path = std::env::temp_dir().join(format!(
+            "qza-raw-{}-{}-{}.sqlite3",
+            name,
+            std::process::id(),
+            crate::util::now_millis()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let connection = crate::db::open_database_at(&path).unwrap();
+        connection
+    }
+
+    fn record(owner: &str, source: &str, body: &[u8]) -> RawRecord {
+        RawRecord {
+            owner_uin: owner.to_owned(),
+            source: source.to_owned(),
+            method: "GET".to_owned(),
+            url: "https://example.test/".to_owned(),
+            query: None,
+            status_code: 200,
+            content_type: Some("application/json".to_owned()),
+            body: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn deduplicates_identical_bodies_per_source() {
+        let connection = temp_db("dedup");
+        let first = save_raw(&connection, &record("10001", "feeds", b"{\"a\":1}")).unwrap();
+        let second = save_raw(&connection, &record("10001", "feeds", b"{\"a\":1}")).unwrap();
+        assert_eq!(first, second, "相同响应应返回同一 id");
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM raw_responses", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn keeps_distinct_bodies_and_sources() {
+        let connection = temp_db("distinct");
+        let a = save_raw(&connection, &record("10001", "feeds", b"{\"a\":1}")).unwrap();
+        let b = save_raw(&connection, &record("10001", "feeds", b"{\"a\":2}")).unwrap();
+        let c = save_raw(&connection, &record("10001", "albums", b"{\"a\":1}")).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM raw_responses", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn stores_binary_bodies_as_blob() {
+        let connection = temp_db("blob");
+        let body: Vec<u8> = vec![0xff, 0x00, 0xfe, 0x01];
+        save_raw(&connection, &record("10001", "feeds", &body)).unwrap();
+        let blob: Vec<u8> = connection
+            .query_row(
+                "SELECT body_blob FROM raw_responses WHERE owner_uin='10001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blob, body);
     }
 }
