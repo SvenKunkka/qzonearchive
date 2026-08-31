@@ -6,7 +6,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection};
@@ -14,7 +13,9 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::Manager;
 
-use crate::{qlogin::QLoginState, qzone};
+use crate::model::{comment_from_values, merge_comments, picture_url_candidates, picture_urls, video_cover_url, video_urls, ArchiveComment, ArchiveReply, LikeUser};
+use crate::util::now;
+use crate::{db, qlogin::QLoginState, qzone, raw};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,36 +99,6 @@ pub struct ArchiveItem {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ArchiveComment {
-    #[serde(skip)]
-    comment_id: Option<String>,
-    uin: Option<String>,
-    nickname: Option<String>,
-    content: String,
-    created_at: i64,
-    replies: Vec<ArchiveReply>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArchiveReply {
-    uin: Option<String>,
-    nickname: Option<String>,
-    reply_to_uin: Option<String>,
-    reply_to_nickname: Option<String>,
-    content: String,
-    created_at: i64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LikeUser {
-    uin: Option<String>,
-    nickname: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Interactor {
     uin: String,
     nickname: String,
@@ -199,13 +170,6 @@ struct ParsedFeed {
     raw_json: String,
 }
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveSkipItem {
@@ -251,205 +215,15 @@ fn archive_page_delay_ms(interval_ms: u64) -> u64 {
 }
 
 fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取应用数据目录：{error}"))?;
-    fs::create_dir_all(&dir).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
-    Ok(dir.join("qzone-archive.sqlite3"))
+    db::database_path(app)
 }
 
 fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
-    let mut connection = Connection::open(database_path(app)?)
-        .map_err(|error| format!("无法打开归档数据库：{error}"))?;
-    connection
-        .execute_batch(
-            "PRAGMA journal_mode=WAL;
-         PRAGMA foreign_keys=ON;
-         CREATE TABLE IF NOT EXISTS archive_feeds (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           owner_uin TEXT NOT NULL,
-           feed_key TEXT NOT NULL,
-           cell_id TEXT,
-           event_type INTEGER NOT NULL DEFAULT 0,
-           event_time INTEGER NOT NULL DEFAULT 0,
-           title TEXT,
-           content TEXT,
-           event_summary TEXT,
-           actor_uin TEXT,
-           actor_name TEXT,
-           original_author_uin TEXT,
-           original_author_name TEXT,
-           picture_count INTEGER NOT NULL DEFAULT 0,
-           pictures_json TEXT,
-           video_json TEXT,
-           comments_json TEXT,
-           raw_json TEXT NOT NULL,
-           archived_at INTEGER NOT NULL,
-           UNIQUE(owner_uin, feed_key)
-         );
-         CREATE INDEX IF NOT EXISTS idx_archive_feeds_owner_time
-           ON archive_feeds(owner_uin, event_time DESC);
-         CREATE INDEX IF NOT EXISTS idx_archive_feeds_dynamic_type
-           ON archive_feeds(owner_uin, cell_id, event_type);
-         CREATE TABLE IF NOT EXISTS archive_dynamics (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           owner_uin TEXT NOT NULL,
-           cell_id TEXT NOT NULL,
-           published_at INTEGER NOT NULL DEFAULT 0,
-           content TEXT,
-           author_uin TEXT,
-           author_name TEXT,
-           category TEXT NOT NULL DEFAULT '',
-           pictures_json TEXT,
-           video_json TEXT,
-           raw_original_json TEXT NOT NULL,
-           archived_at INTEGER NOT NULL,
-           UNIQUE(owner_uin, cell_id)
-         );
-         CREATE INDEX IF NOT EXISTS idx_archive_dynamics_owner_time
-           ON archive_dynamics(owner_uin, published_at DESC);
-         CREATE TABLE IF NOT EXISTS archive_checkpoints (
-           owner_uin TEXT PRIMARY KEY,
-           attach_info TEXT NOT NULL,
-           pages INTEGER NOT NULL DEFAULT 0,
-           fetched INTEGER NOT NULL DEFAULT 0,
-           saved INTEGER NOT NULL DEFAULT 0,
-           updated_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS archive_rate_limits (
-           owner_uin TEXT PRIMARY KEY,
-           window_started_at INTEGER NOT NULL,
-           requested_pages INTEGER NOT NULL DEFAULT 0
-         );
-         CREATE TABLE IF NOT EXISTS archive_skips (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           owner_uin TEXT NOT NULL,
-           cursor TEXT NOT NULL,
-           resume_cursor TEXT NOT NULL,
-           page_number INTEGER NOT NULL,
-           cursor_offset INTEGER NOT NULL,
-           offset_advance INTEGER NOT NULL,
-           base_time INTEGER NOT NULL,
-           error TEXT NOT NULL,
-           skipped_at INTEGER NOT NULL,
-           retry_count INTEGER NOT NULL DEFAULT 0,
-           last_retry_at INTEGER,
-           resolved_at INTEGER,
-           recovered_records INTEGER NOT NULL DEFAULT 0,
-           UNIQUE(owner_uin, cursor_offset, base_time)
-         );",
-        )
-        .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
-    if connection
-        .prepare("SELECT pages,fetched,saved FROM archive_checkpoints LIMIT 0")
-        .is_err()
-    {
-        connection
-            .execute_batch(
-                "ALTER TABLE archive_checkpoints ADD COLUMN pages INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE archive_checkpoints ADD COLUMN fetched INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE archive_checkpoints ADD COLUMN saved INTEGER NOT NULL DEFAULT 0;",
-            )
-            .map_err(|error| format!("升级归档续传统计失败：{error}"))?;
-    }
-    if connection
-        .prepare("SELECT category FROM archive_dynamics LIMIT 0")
-        .is_err()
-    {
-        connection
-            .execute(
-                "ALTER TABLE archive_dynamics ADD COLUMN category TEXT NOT NULL DEFAULT ''",
-                [],
-            )
-            .map_err(|error| format!("升级归档分类失败：{error}"))?;
-    }
-    migrate_legacy_dynamics(&mut connection)?;
-    migrate_dynamic_categories(&mut connection)?;
-    Ok(connection)
-}
-
-fn migrate_dynamic_categories(connection: &mut Connection) -> Result<(), String> {
-    let pending: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM archive_dynamics WHERE category=''",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("检查归档分类迁移状态失败：{error}"))?;
-    if pending == 0 {
-        return Ok(());
-    }
-    let feeds = {
-        let mut statement = connection
-            .prepare("SELECT owner_uin,raw_json FROM archive_feeds")
-            .map_err(|error| format!("读取待分类归档失败：{error}"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| format!("查询待分类归档失败：{error}"))?;
-        rows.filter_map(Result::ok).collect::<Vec<_>>()
-    };
-    let transaction = connection
-        .transaction()
-        .map_err(|error| format!("开始归档分类迁移失败：{error}"))?;
-    for (owner_uin, raw_json) in feeds {
-        if let Ok(feed) = serde_json::from_str::<Value>(&raw_json) {
-            save_original_dynamic(&transaction, &owner_uin, &feed)?;
-        }
-    }
-    transaction.execute(
-        "UPDATE archive_dynamics SET category=CASE WHEN author_uin=owner_uin THEN 'self' ELSE 'other' END WHERE category=''",
-        [],
-    ).map_err(|error| format!("补全归档分类失败：{error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("提交归档分类迁移失败：{error}"))
-}
-
-fn migrate_legacy_dynamics(connection: &mut Connection) -> Result<(), String> {
-    let dynamic_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM archive_dynamics", [], |row| {
-            row.get(0)
-        })
-        .map_err(|error| format!("检查原动态迁移状态失败：{error}"))?;
-    if dynamic_count > 0 {
-        return Ok(());
-    }
-    let legacy = {
-        let mut statement = connection
-            .prepare("SELECT owner_uin,raw_json FROM archive_feeds")
-            .map_err(|error| format!("读取旧归档失败：{error}"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| format!("查询旧归档失败：{error}"))?;
-        rows.filter_map(Result::ok).collect::<Vec<_>>()
-    };
-    if legacy.is_empty() {
-        return Ok(());
-    }
-    let transaction = connection
-        .transaction()
-        .map_err(|error| format!("开始旧归档迁移失败：{error}"))?;
-    for (owner_uin, raw_json) in legacy {
-        if let Ok(feed) = serde_json::from_str::<Value>(&raw_json) {
-            save_original_dynamic(&transaction, &owner_uin, &feed)?;
-        }
-    }
-    transaction
-        .commit()
-        .map_err(|error| format!("提交旧归档迁移失败：{error}"))
+    db::open_database(app)
 }
 
 fn text_at(value: &Value, pointer: &str) -> Option<String> {
-    value.pointer(pointer).and_then(|value| match value {
-        Value::String(text) if !text.is_empty() => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        _ => None,
-    })
+    crate::util::text_at(value, pointer)
 }
 
 fn parse_feed(feed: &Value) -> Result<ParsedFeed, String> {
@@ -516,10 +290,12 @@ fn save_feed_rows(
     transaction: &rusqlite::Transaction<'_>,
     owner_uin: &str,
     feeds: &[Value],
+    raw_response_id: Option<i64>,
 ) -> Result<u64, String> {
     let mut saved = 0;
     for feed in feeds {
-        save_original_dynamic(transaction, owner_uin, feed)?;
+        // 统一模型：动态（archive_dynamics）+ 用户/评论/点赞/回复/来源行
+        model::save_dynamic(transaction, owner_uin, feed, raw_response_id, "feeds")?;
         let feed = parse_feed(feed)?;
         let changed = transaction.execute(
             "INSERT INTO archive_feeds
@@ -545,10 +321,32 @@ fn save_feed_rows(
     Ok(saved)
 }
 
+/// 把一页响应写入 Raw 留存层（按 body SHA-256 去重）。
+fn save_page_raw(
+    transaction: &rusqlite::Transaction<'_>,
+    owner_uin: &str,
+    page: &qzone::FeedPage,
+) -> Result<Option<i64>, String> {
+    if page.raw_body.is_empty() {
+        return Ok(None);
+    }
+    let record = raw::RawRecord {
+        owner_uin: owner_uin.to_owned(),
+        source: "feeds".to_owned(),
+        method: "GET".to_owned(),
+        url: page.raw_url.clone(),
+        query: page.raw_query.clone(),
+        status_code: page.raw_status,
+        content_type: page.raw_content_type.clone(),
+        body: page.raw_body.as_bytes().to_vec(),
+    };
+    raw::save_raw(transaction, &record).map(Some)
+}
+
 fn save_page(
     app: &tauri::AppHandle,
     owner_uin: &str,
-    feeds: &[Value],
+    page: &qzone::FeedPage,
     next_cursor: Option<&str>,
     reset_checkpoint_stats: bool,
 ) -> Result<u64, String> {
@@ -556,14 +354,15 @@ fn save_page(
     let transaction = connection
         .transaction()
         .map_err(|error| format!("无法开始数据库事务：{error}"))?;
-    let saved = save_feed_rows(&transaction, owner_uin, feeds)?;
+    let raw_id = save_page_raw(&transaction, owner_uin, page)?;
+    let saved = save_feed_rows(&transaction, owner_uin, &page.feeds, raw_id)?;
     if let Some(cursor) = next_cursor {
         if reset_checkpoint_stats {
             transaction.execute(
                 "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at) VALUES (?1,?2,1,?3,?4,?5)
                  ON CONFLICT(owner_uin) DO UPDATE SET attach_info=excluded.attach_info,
                   pages=1,fetched=excluded.fetched,saved=excluded.saved,updated_at=excluded.updated_at",
-                params![owner_uin, cursor, feeds.len() as u64, saved, now()],
+                params![owner_uin, cursor, page.feeds.len() as u64, saved, now()],
             ).map_err(|error| format!("重置归档续传位置失败：{error}"))?;
         } else {
             transaction.execute(
@@ -571,7 +370,7 @@ fn save_page(
                  ON CONFLICT(owner_uin) DO UPDATE SET attach_info=excluded.attach_info,
                   pages=archive_checkpoints.pages+1,fetched=archive_checkpoints.fetched+excluded.fetched,
                   saved=archive_checkpoints.saved+excluded.saved,updated_at=excluded.updated_at",
-                params![owner_uin, cursor, feeds.len() as u64, saved, now()],
+                params![owner_uin, cursor, page.feeds.len() as u64, saved, now()],
             ).map_err(|error| format!("保存归档续传位置失败：{error}"))?;
         }
     } else {
@@ -591,13 +390,14 @@ fn save_page(
 fn save_retried_page(
     app: &tauri::AppHandle,
     owner_uin: &str,
-    feeds: &[Value],
+    page: &qzone::FeedPage,
 ) -> Result<u64, String> {
     let mut connection = open_database(app)?;
     let transaction = connection
         .transaction()
         .map_err(|error| format!("无法开始重试事务：{error}"))?;
-    let saved = save_feed_rows(&transaction, owner_uin, feeds)?;
+    let raw_id = save_page_raw(&transaction, owner_uin, page)?;
+    let saved = save_feed_rows(&transaction, owner_uin, &page.feeds, raw_id)?;
     transaction
         .commit()
         .map_err(|error| format!("提交重试事务失败：{error}"))?;
@@ -865,131 +665,6 @@ fn load_checkpoint(
     }
 }
 
-fn save_original_dynamic(
-    transaction: &rusqlite::Transaction<'_>,
-    owner_uin: &str,
-    feed: &Value,
-) -> Result<(), String> {
-    let Some(original) = feed.get("original") else {
-        return Ok(());
-    };
-    let Some(cell_id) = text_at(original, "/cell_id/cellid") else {
-        return Ok(());
-    };
-    let original_appid = original
-        .pointer("/cell_comm/appid")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let original_key = text_at(original, "/cell_comm/feedskey").unwrap_or_default();
-    let is_guestbook = original_appid == 334 || original_key.starts_with("334_");
-    let published_at = original
-        .pointer("/cell_comm/time")
-        .and_then(Value::as_i64)
-        .or_else(|| feed.pointer("/comm/time").and_then(Value::as_i64))
-        .unwrap_or(0);
-    let content = if is_guestbook {
-        text_at(feed, "/summary/summary")
-    } else {
-        text_at(original, "/cell_summary/summary")
-    };
-    let author_uin = if is_guestbook {
-        text_at(feed, "/userinfo/user/uin")
-    } else {
-        text_at(original, "/cell_userinfo/user/uin")
-    };
-    let author_name = if is_guestbook {
-        text_at(feed, "/userinfo/user/nickname")
-    } else {
-        text_at(original, "/cell_userinfo/user/nickname")
-    };
-    let category = if is_guestbook {
-        "guestbook"
-    } else if author_uin.as_deref() == Some(owner_uin) {
-        "self"
-    } else {
-        "other"
-    };
-    let pictures_json = original
-        .get("cell_pic")
-        .filter(|value| !value.is_null())
-        .map(Value::to_string);
-    let video_json = original
-        .get("cell_video")
-        .filter(|value| !value.is_null())
-        .map(Value::to_string);
-    transaction.execute(
-        "INSERT INTO archive_dynamics
-         (owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,raw_original_json,archived_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-         ON CONFLICT(owner_uin,cell_id) DO UPDATE SET
-          published_at=excluded.published_at,content=excluded.content,author_uin=excluded.author_uin,
-          author_name=excluded.author_name,category=excluded.category,pictures_json=COALESCE(excluded.pictures_json,archive_dynamics.pictures_json),
-          video_json=COALESCE(excluded.video_json,archive_dynamics.video_json),
-          raw_original_json=excluded.raw_original_json,archived_at=excluded.archived_at",
-        params![owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,original.to_string(),now()],
-    ).map_err(|error| format!("保存原动态失败：{error}"))?;
-    Ok(())
-}
-
-fn picture_url_candidates(json: Option<String>) -> Vec<Vec<String>> {
-    let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else {
-        return vec![];
-    };
-    value
-        .pointer("/picdata/pic")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|pic| {
-            let photo_urls = pic.get("photourl")?;
-            let values = match photo_urls {
-                Value::Array(items) => items.iter().collect::<Vec<_>>(),
-                Value::Object(items) => items.values().collect::<Vec<_>>(),
-                _ => vec![],
-            };
-            let candidates = values
-                .into_iter()
-                .filter_map(|item| {
-                    let url = item.get("url")?.as_str()?.trim();
-                    if url.is_empty() {
-                        return None;
-                    }
-                    Some(url.to_owned())
-                })
-                .collect::<Vec<_>>();
-            let mut candidates = candidates;
-            if let Some(url) = pic
-                .pointer("/busi_param/-1")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|url| !url.is_empty())
-            {
-                candidates.push(url.to_owned());
-            }
-            let mut seen = HashSet::new();
-            let urls = candidates
-                .into_iter()
-                .map(|url| {
-                    if url.starts_with("//") {
-                        format!("https:{url}")
-                    } else {
-                        url
-                    }
-                })
-                .filter(|url| seen.insert(url.clone()))
-                .collect::<Vec<_>>();
-            (!urls.is_empty()).then_some(urls)
-        })
-        .collect()
-}
-
-fn picture_urls(json: Option<String>) -> Vec<String> {
-    picture_url_candidates(json)
-        .into_iter()
-        .filter_map(|urls| urls.into_iter().next())
-        .collect()
-}
-
 fn archived_image_extension(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("jpg")
@@ -1162,43 +837,6 @@ pub async fn load_archived_image(
     Err(format!("所有 QQ 图片地址均加载失败：{last_error}"))
 }
 
-fn video_urls(json: Option<String>) -> Vec<String> {
-    let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else {
-        return vec![];
-    };
-    let mut urls = Vec::new();
-    if let Some(url) = value.get("videourl").and_then(Value::as_str) {
-        urls.push(url.to_owned());
-    }
-    if let Some(items) = value.get("videourls").and_then(Value::as_object) {
-        for url in items
-            .values()
-            .filter_map(|item| item.get("url").and_then(Value::as_str))
-        {
-            if !urls.iter().any(|saved| saved == url) {
-                urls.push(url.to_owned());
-            }
-        }
-    }
-    urls
-}
-
-fn video_cover_url(json: Option<String>) -> Option<String> {
-    let value = json.and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
-    value
-        .pointer("/coverurl/0/url")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            value
-                .get("coverurl")?
-                .as_object()?
-                .values()
-                .find_map(|item| item.get("url")?.as_str())
-        })
-        .map(str::to_owned)
-}
-
-#[tauri::command]
 pub async fn load_archived_video(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
@@ -2223,149 +1861,6 @@ pub async fn get_archived_feed(
         .filter_map(Result::ok)
         .collect();
     Ok(item)
-}
-
-fn comment_from_values(
-    json: Option<String>,
-    fallback_uin: Option<String>,
-    fallback_name: Option<String>,
-    fallback_content: Option<String>,
-    fallback_time: i64,
-) -> ArchiveComment {
-    let value = json.and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    let main = value.as_ref().and_then(|value| value.get("main_comment"));
-    let comment_id = main.and_then(|value| text_at(value, "/commentid"));
-    let main_uin = main.and_then(|value| text_at(value, "/user/uin"));
-    let main_name = main.and_then(|value| text_at(value, "/user/nickname"));
-    let main_content = main.and_then(|value| text_at(value, "/content"));
-    let main_time = main
-        .and_then(|value| value.get("date"))
-        .and_then(Value::as_i64)
-        .unwrap_or(fallback_time);
-    let mut replies: Vec<ArchiveReply> = main
-        .and_then(|value| value.get("replys"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(reply_from_value)
-        .collect();
-    if let Some(comment_id) = comment_id.as_deref() {
-        let related_replies = value
-            .as_ref()
-            .and_then(|value| value.get("comments"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|comment| text_at(comment, "/commentid").as_deref() == Some(comment_id))
-            .filter_map(|comment| comment.get("replys"))
-            .filter_map(Value::as_array)
-            .flatten()
-            .filter_map(reply_from_value);
-        for reply in related_replies {
-            let duplicate = replies.iter().any(|candidate| {
-                candidate.uin == reply.uin
-                    && candidate.content == reply.content
-                    && candidate.created_at == reply.created_at
-            });
-            if !duplicate {
-                replies.push(reply);
-            }
-        }
-    }
-
-    // Reply notifications keep the parent in main_comment but put the actual
-    // reply text and author at the feed level. When the parent author replies
-    // again, target the latest preceding reply from the other participant.
-    let is_reply_notification = main
-        .and_then(|value| value.get("replynum"))
-        .and_then(Value::as_i64)
-        .is_some_and(|count| count > 0)
-        && main_uin.is_some()
-        && fallback_uin.is_some()
-        && main_content.as_deref() != fallback_content.as_deref()
-        && fallback_time > main_time;
-    if is_reply_notification {
-        if let Some(content) = fallback_content.clone() {
-            let duplicate = replies
-                .iter()
-                .any(|reply| reply.uin == fallback_uin && reply.content == content);
-            if !duplicate {
-                let reply_target = replies
-                    .iter()
-                    .filter(|reply| reply.uin != fallback_uin && reply.created_at <= fallback_time)
-                    .max_by_key(|reply| reply.created_at);
-                replies.push(ArchiveReply {
-                    uin: fallback_uin.clone(),
-                    nickname: fallback_name.clone(),
-                    reply_to_uin: reply_target
-                        .and_then(|reply| reply.uin.clone())
-                        .or_else(|| main_uin.clone()),
-                    reply_to_nickname: reply_target
-                        .and_then(|reply| reply.nickname.clone())
-                        .or_else(|| main_name.clone()),
-                    content,
-                    created_at: fallback_time,
-                });
-            }
-        }
-    }
-
-    ArchiveComment {
-        comment_id,
-        uin: main_uin.or(fallback_uin),
-        nickname: main_name.or(fallback_name),
-        content: main_content
-            .or(fallback_content)
-            .unwrap_or_else(|| "评论了这条动态".into()),
-        created_at: main_time,
-        replies,
-    }
-}
-
-fn reply_from_value(value: &Value) -> Option<ArchiveReply> {
-    let content = text_at(value, "/content")?;
-    Some(ArchiveReply {
-        uin: text_at(value, "/user/uin").or_else(|| text_at(value, "/replyuser/uin")),
-        nickname: text_at(value, "/user/nickname")
-            .or_else(|| text_at(value, "/replyuser/nickname")),
-        reply_to_uin: text_at(value, "/replyuser/uin")
-            .or_else(|| text_at(value, "/targetuser/uin"))
-            .or_else(|| text_at(value, "/target/uin")),
-        reply_to_nickname: text_at(value, "/replyuser/nickname")
-            .or_else(|| text_at(value, "/targetuser/nickname"))
-            .or_else(|| text_at(value, "/target/nickname")),
-        content,
-        created_at: value.get("date").and_then(Value::as_i64).unwrap_or(0),
-    })
-}
-
-fn merge_comments(comments: impl IntoIterator<Item = ArchiveComment>) -> Vec<ArchiveComment> {
-    let mut merged: Vec<ArchiveComment> = Vec::new();
-    for mut comment in comments {
-        let existing = merged.iter_mut().find(|candidate| {
-            (comment.comment_id.is_some() && candidate.comment_id == comment.comment_id)
-                || (candidate.uin == comment.uin
-                    && candidate.content == comment.content
-                    && candidate.created_at == comment.created_at)
-        });
-        if let Some(existing) = existing {
-            for reply in comment.replies.drain(..) {
-                let duplicate = existing.replies.iter().any(|candidate| {
-                    candidate.uin == reply.uin
-                        && candidate.content == reply.content
-                        && candidate.created_at == reply.created_at
-                });
-                if !duplicate {
-                    existing.replies.push(reply);
-                }
-            }
-            existing.replies.sort_by_key(|reply| reply.created_at);
-        } else {
-            comment.replies.sort_by_key(|reply| reply.created_at);
-            merged.push(comment);
-        }
-    }
-    merged
 }
 
 fn validate_category(category: &str) -> Result<(), String> {
