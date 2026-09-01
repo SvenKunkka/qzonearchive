@@ -82,7 +82,7 @@ fn install_recycle_request_listener(window: &tauri::WebviewWindow, state: Recycl
     });
 }
 
-fn parse_qzone_json(text: &str) -> Result<Value, String> {
+pub(crate) fn parse_qzone_json(text: &str) -> Result<Value, String> {
     let normalized = text.trim().trim_start_matches('\u{feff}').trim();
     if normalized.is_empty() {
         return Ok(json!({ "code": 0 }));

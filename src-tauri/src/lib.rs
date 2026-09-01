@@ -75,6 +75,7 @@ pub fn run() {
             media::list_media_items,
             media::get_media_stats,
             sources::albums::sync_album_list_command,
+            sources::shuoshuo::sync_shuoshuo_command,
             sources::list_source_states_command,
             sources::reset_source_state_command,
         ])

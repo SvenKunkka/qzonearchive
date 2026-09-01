@@ -10,6 +10,7 @@
 //! 未验证的接口一律不在此层调用。
 
 pub mod albums;
+pub mod shuoshuo;
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -18,6 +19,7 @@ use crate::util::now;
 
 pub const SOURCE_FEEDS: &str = "feeds";
 pub const SOURCE_ALBUM_LIST: &str = "album_list";
+pub const SOURCE_SHUOSHUO: &str = "shuoshuo";
 
 /// 每数据源同步状态（对应 source_states 表）。
 #[derive(Clone, Serialize)]

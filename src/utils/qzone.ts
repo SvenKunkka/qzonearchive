@@ -137,3 +137,5 @@ export interface AlbumSyncResult { listed: number; saved: number; remoteMarked: 
 export const listSourceStates = () => invoke<SourceStateInfo[]>("list_source_states_command");
 export const resetSourceState = (source: string) => invoke<void>("reset_source_state_command", { source });
 export const syncAlbumList = () => invoke<AlbumSyncResult>("sync_album_list_command");
+export interface ShuoshuoSyncResult { total: number; fetched: number; saved: number; existing: number; }
+export const syncShuoshuo = (intervalMs = 1500) => invoke<ShuoshuoSyncResult>("sync_shuoshuo_command", { intervalMs });

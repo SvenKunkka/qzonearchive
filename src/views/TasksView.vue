@@ -7,7 +7,7 @@ import Tag from "primevue/tag";
 import {
   cancelFeedArchive, cancelMediaDownload, clearResolvedArchiveSkips, getArchiveProgress, getMediaDownloadProgress, getMediaStats, listArchiveSkips,
   listSourceStates, pauseMediaDownload, resetSourceState, resumeMediaDownload, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive, startMediaDownload,
-  syncAlbumList, type ArchiveProgress, type ArchiveSkipItem, type MediaDownloadProgress, type MediaStats, type SourceStateInfo,
+  syncAlbumList, syncShuoshuo, type ArchiveProgress, type ArchiveSkipItem, type MediaDownloadProgress, type MediaStats, type SourceStateInfo,
 } from "../utils/qzone";
 import { useAuthStore } from "../stores/auth";
 import { getArchiveInterval, getIncrementalSync } from "../utils/appSettings";
@@ -22,6 +22,7 @@ const mediaMode = ref<MediaDownloadMode>(getMediaDownloadMode());
 const incrementalSync = ref(getIncrementalSync());
 const sourceStates = ref<SourceStateInfo[]>([]);
 const syncingAlbumList = ref(false);
+const syncingShuoshuo = ref(false);
 const sourceNotice = ref("");
 const skips = ref<ArchiveSkipItem[]>([]);
 const retryingId = ref<number>();
@@ -106,6 +107,20 @@ async function runAlbumSync() {
     await refresh();
   }
 }
+async function runShuoshuoSync() {
+  if (!loggedIn.value || syncingShuoshuo.value) return;
+  syncingShuoshuo.value = true;
+  sourceNotice.value = "";
+  try {
+    const result = await syncShuoshuo();
+    sourceNotice.value = `全部说说同步完成：共 ${result.total} 条，本次保存 ${result.saved} 条${result.existing ? `，跳过已归档 ${result.existing} 条` : ""}`;
+  } catch (error) {
+    sourceNotice.value = String(error);
+  } finally {
+    syncingShuoshuo.value = false;
+    await refresh();
+  }
+}
 async function resetSource(source: string) {
   try {
     await resetSourceState(source);
@@ -117,6 +132,9 @@ async function resetSource(source: string) {
 }
 function sourceStatusText(item: SourceStateInfo) {
   return ({ idle: "未同步", running: "同步中", completed: "已同步", error: "出错", limited: "频率保护", cancelled: "已取消" } as Record<string, string>)[item.status] ?? item.status;
+}
+function sourceLabel(source: string) {
+  return ({ feeds: "互动列表", album_list: "相册列表", shuoshuo: "全部说说" } as Record<string, string>)[source] ?? source;
 }
 function formatSourceTime(timestamp?: number) {
   return timestamp ? new Date(timestamp * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
@@ -234,12 +252,13 @@ onBeforeUnmount(() => window.clearInterval(timer));
     <div class="source-states-list" role="list">
       <article v-for="item in sourceStates" :key="item.source" class="source-state-item">
         <div class="source-state-copy">
-          <div><strong>{{ item.source === 'feeds' ? '互动列表' : '相册列表' }}</strong><Tag :value="sourceStatusText(item)" :severity="item.status === 'completed' ? 'success' : item.status === 'error' ? 'danger' : item.status === 'running' ? 'info' : item.status === 'limited' ? 'warn' : 'secondary'" /></div>
+          <div><strong>{{ sourceLabel(item.source) }}</strong><Tag :value="sourceStatusText(item)" :severity="item.status === 'completed' ? 'success' : item.status === 'error' ? 'danger' : item.status === 'running' ? 'info' : item.status === 'limited' ? 'warn' : 'secondary'" /></div>
           <small>获取 {{ item.totalFetched }} 条 · 保存 {{ item.totalSaved }} 条 · 最近同步 {{ formatSourceTime(item.lastSyncAt) }}</small>
           <small v-if="item.cursor" class="source-state-cursor">游标：{{ item.cursor }}</small>
           <small v-if="item.lastError" class="source-state-error">上次错误：{{ item.lastError }}</small>
         </div>
         <div class="source-state-actions">
+          <Button v-if="item.source === 'shuoshuo'" label="同步全部说说" icon="pi pi-comment" size="small" :loading="syncingShuoshuo" :disabled="syncingShuoshuo || !loggedIn" @click="runShuoshuoSync" />
           <Button v-if="item.source === 'album_list'" label="同步相册列表" icon="pi pi-images" size="small" :loading="syncingAlbumList && item.source === 'album_list'" :disabled="syncingAlbumList || !loggedIn" @click="runAlbumSync" />
           <Button label="重置" icon="pi pi-replay" size="small" severity="secondary" outlined :disabled="!loggedIn" @click="resetSource(item.source)" />
         </div>
