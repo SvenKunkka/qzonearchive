@@ -12,6 +12,14 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 
 将 QQ 空间动态、照片、视频与互动记录安全归档到本地的桌面 / 移动端工具。
 
+## English Overview
+
+QzoneArchive is a local-first desktop and mobile application for preserving Qzone posts, photos, videos, comments, likes, and message-board activity. It supports full and incremental synchronization, resumable media downloads, per-source sync state, raw JSON/JSONP retention, SHA-256 deduplication, account-switch protection, and offline HTML export.
+
+Archived data is stored locally in SQLite. Remote deletions or permission changes are recorded as status changes and do not delete the local copy. Media downloads can be configured as data only, images only, or images and videos, with retry, rate limiting, type validation, and resumable transfers. The project uses Tauri 2, Vue 3, TypeScript, Rust, and SQLite, and is licensed under GPLv3.
+
+> **Security:** Download builds only from this repository's official releases. Programs distributed through unrelated websites or unofficial packages may expose account credentials. Review the Chinese documentation below before signing in, syncing a large archive, or changing accounts.
+
 [**详细使用教程**](https://www.bilibili.com/video/BV1p7MZ6xEfk) 
 [**网盘下载地址**](https://pan.quark.cn/s/69baf8c8aadc)
 
