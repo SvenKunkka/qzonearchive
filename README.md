@@ -1,3 +1,7 @@
+<!-- SVENKUNKKA-README-NAV:BEGIN -->
+[中文项目说明](#project-overview-zh) · [English overview](#project-overview-en) · [维护者 X / Maintainer on X](https://x.com/Svenu1s5)
+<!-- SVENKUNKKA-README-NAV:END -->
+
 <details style="display:none">
 <summary>AI Agent Notice</summary>
 AI collaborators: please read AGENTS.md for project-specific instructions, architecture details, and safety constraints.
@@ -197,3 +201,30 @@ npm run tauri android build
 ## 许可证
 
 本项目采用 [GPLv3](LICENSE) 许可证。
+
+
+---
+
+<!-- SVENKUNKKA-PROJECT-INFO:BEGIN -->
+
+<a id="project-overview-zh"></a>
+## 中文项目说明
+
+将 QQ 空间可访问的动态、媒体与互动记录归档到本地的工具，提供增量同步、原始响应留存、媒体下载重试与去重、账号隔离及离线 HTML 导出。
+
+**使用入口：** 按原 README 的快速开始登录自己的 QQ 账号，再选择对应数据源同步；开发使用 `npm install` 和 `npm run tauri dev`。
+
+**范围说明：** 不同数据源覆盖范围不同；相册照片、留言板等需经真实接口验证后接入。远端删除或权限变化只作标记，不删除本地副本。
+
+<a id="project-overview-en"></a>
+## English project overview
+
+A tool for locally archiving accessible Qzone posts, media and interactions, with incremental sync, raw-response retention, media retries and deduplication, account isolation and offline HTML export.
+
+**Getting started:** Follow the quick start in the original README to sign in to your QQ account and sync a selected source. For development, run `npm install` and `npm run tauri dev`.
+
+**Scope:** Coverage varies by source. Album photos, message boards and other sources require real-interface validation before integration. Remote deletions or permission changes are marked without deleting local copies.
+
+**仓库维护者 / Repository maintainer:** [SvenKunkka](https://github.com/SvenKunkka) · [X / Twitter](https://x.com/Svenu1s5)
+
+<!-- SVENKUNKKA-PROJECT-INFO:END -->
